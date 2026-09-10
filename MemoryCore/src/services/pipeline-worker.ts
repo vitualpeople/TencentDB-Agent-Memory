@@ -125,6 +125,34 @@ const TAG = "[pipeline-worker]";
  */
 const MAX_LOCK_REQUEUE = 15;
 
+/**
+ * Timer-fired L1 dedup + count claim. The executor calls this before running
+ * L1 for a task with `data.triggeredBy === "timer_scanner"`.
+ *
+ * Reads the live conversation_count under the task's (teamId, agentId), which
+ * is the key captureAtomic counted under now that buildPipelineTimerMember
+ * keeps a half-set scope. Returns true when there is nothing to extract
+ * (count 0: a threshold-fired L1 already consumed it) and marks the task so
+ * cascadeSchedule neither resets the count nor advances L2. Otherwise records
+ * the count this run consumes, so cascadeSchedule subtracts exactly that
+ * instead of zeroing rounds that arrive while the run is in flight.
+ */
+export async function claimTimerL1Count(
+  backend: IStateBackend,
+  task: TaskPayload,
+  instanceId: string,
+  teamId?: string,
+  agentId?: string,
+): Promise<boolean> {
+  const state = await backend.getSessionState(instanceId, task.sessionId, teamId, agentId);
+  if (state && state.conversation_count === 0) {
+    (task as any)._l1Skipped = true;
+    return true;
+  }
+  (task as any)._l1ConsumedCount = state?.conversation_count ?? 0;
+  return false;
+}
+
 // ============================
 // PipelineWorker
 // ============================
@@ -591,10 +619,32 @@ export class PipelineWorker {
     const aid = task.agentId ?? (task.data as any)?.agentId;
 
     if (task.type === "L1" || task.type === "flush") {
-      // L1 完成 → reset session-level L1 state, then advance agent/profile-level L2 timers.
-      await this.backend.updateSessionState(task.instanceId, task.sessionId, {
-        conversation_count: 0,
-      }, tid, aid);
+      if ((task as any)._l1Skipped) {
+        // Nothing was extracted, so nothing was consumed: leave the live count
+        // and its idle timer alone and do not advance L2.
+        this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L1 skipped (count=0), session state left untouched`);
+        return;
+      }
+      // L1 完成 → release only what this task consumed, then advance agent/profile-level L2 timers.
+      // A threshold-fired L1 was already zeroed by captureAtomic when it was
+      // enqueued; a timer-fired L1 recorded the count it found in
+      // _l1ConsumedCount (see claimTimerL1Count). Assigning 0 here would also
+      // wipe rounds counted while the task ran, and the next timer fire would
+      // then be deduplicated against that false zero.
+      if (task.type === "flush") {
+        await this.backend.updateSessionState(task.instanceId, task.sessionId, {
+          conversation_count: 0,
+        }, tid, aid);
+      } else {
+        const consumed = (task as any)._l1ConsumedCount;
+        if (typeof consumed === "number" && consumed > 0) {
+          const state = await this.backend.getSessionState(task.instanceId, task.sessionId, tid, aid);
+          const remaining = Math.max(0, (state?.conversation_count ?? 0) - consumed);
+          await this.backend.updateSessionState(task.instanceId, task.sessionId, {
+            conversation_count: remaining,
+          }, tid, aid);
+        }
+      }
       const profileScopes = Array.isArray((task as any)._l2ProfileScopes)
         ? ((task as any)._l2ProfileScopes as string[]).filter(Boolean)
         : [];

@@ -34,8 +34,15 @@ export function buildPipelineTimerMember(
   timerType: string,
   ctx?: PipelineTimerMemberContext,
 ): string {
-  if (ctx?.teamId && ctx?.agentId) {
-    return `${SCOPED_TIMER_PREFIX}team:${encodeURIComponent(ctx.teamId)}|agent:${encodeURIComponent(ctx.agentId)}|session:${encodeURIComponent(sessionId)}:${timerType}`;
+  // Scope the member whenever EITHER id is set. The session-state key is
+  // `{instance}:{teamId||"_"}:{agentId||"_"}:{session}`, built from the same
+  // pair, so a member that drops a lone agentId makes the timer-fired task read
+  // and reset a different state entry than the one captureAtomic counted under.
+  // resolveIsolation() defaults agentId to "default" but leaves teamId unset,
+  // so the half-scoped pair is the normal case for any client without team_id.
+  // An unset half is written as "" and parses back to undefined.
+  if (ctx?.teamId || ctx?.agentId) {
+    return `${SCOPED_TIMER_PREFIX}team:${encodeURIComponent(ctx.teamId ?? "")}|agent:${encodeURIComponent(ctx.agentId ?? "")}|session:${encodeURIComponent(sessionId)}:${timerType}`;
   }
   return `${sessionId}:${timerType}`;
 }
