@@ -114,6 +114,7 @@ import { LocalStorageBackend } from "../core/storage/local-backend.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import type { TaskPayload } from "../core/state/types.js";
 import type { TaskExecutor } from "../services/pipeline-worker.js";
+import { claimTimerL1Count } from "../services/pipeline-worker.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { TimerScanner } from "../services/timer-scanner.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
@@ -2692,10 +2693,11 @@ export class TdaiGateway {
         // before we even started, bail out without doing any work.
         if (signal?.aborted) throw signal.reason ?? new Error("executeL1: aborted before start");
 
-        // Dedup: if triggered by timer but session already processed (count=0), skip
+        // Dedup: if triggered by timer but session already processed (count=0), skip.
+        // claimTimerL1Count also records what this run consumes so cascadeSchedule
+        // does not zero rounds counted while the run is in flight.
         if (task.data?.triggeredBy === "timer_scanner" && gateway.stateBackend) {
-          const state = await gateway.stateBackend.getSessionState(instanceId, task.sessionId, teamId, agentId);
-          if (state && state.conversation_count === 0) {
+          if (await claimTimerL1Count(gateway.stateBackend, task, instanceId, teamId, agentId)) {
             gateway.logger.debug?.(`[executor] L1 skipped: session ${task.sessionId} already processed (count=0)`);
             return;
           }
