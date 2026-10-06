@@ -1,0 +1,37 @@
+# Claude Code worker for this fork. See docs/docker-cc-worker.md.
+# Not a production deployment: that is MemoryCore/Dockerfile (tdai-gateway).
+#   docker compose -f docker-compose.cc.yml run --rm cc-worker          # Claude TUI on $TASK_BRANCH
+#   docker compose -f docker-compose.cc.yml run --rm cc-worker test     # MemoryCore gate in a fresh clone, no LLM
+#   docker compose -f docker-compose.cc.yml up -d cc-worker-serve       # headless Orca runtime to pair with
+services:
+  cc-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cc-worker
+    image: tencentdb-agent-memory-cc-worker
+    env_file:
+      - path: .env.cc
+        required: false
+    # GH_TOKEN comes from .env.cc, or from the shell with `run -e GH_TOKEN`
+    # (not declared here: an `environment:` entry would override .env.cc).
+    stdin_open: true
+    tty: true
+    security_opt:
+      - no-new-privileges:true
+
+  # Headless Orca runtime (entrypoint `serve`) for the host to pair with:
+  #   docker compose -f docker-compose.cc.yml up -d cc-worker-serve        # GH_TOKEN from .env.cc
+  #   GH_TOKEN="$(gh auth token)" docker compose -f docker-compose.cc.yml run -d --service-ports -e GH_TOKEN cc-worker-serve
+  # Its stdout is one JSON line (orca_server_ready); pairing.url and
+  # pairing.webClientUrl both carry the secret pairing code. Read the url
+  # from `docker compose logs`, never print either. No TTY, so the line stays
+  # clean JSON. Published on loopback only, on 17784: 17777-17783 are the
+  # other repos' workers.
+  cc-worker-serve:
+    extends:
+      service: cc-worker
+    command: ["serve"]
+    stdin_open: false
+    tty: false
+    ports:
+      - "127.0.0.1:17784:17777"

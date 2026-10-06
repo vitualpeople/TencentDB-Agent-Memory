@@ -6,6 +6,7 @@ workspace/
 
 # Environment variables
 .env
+.env.cc
 
 # Test caches
 __tests__/soak/.model-cache/
@@ -59,6 +60,7 @@ sdk/python/*.egg-info/
 # Environment (already covered above, explicit for clarity)
 .env.*
 !.env.example
+!.env.cc.example
 
 # offload_server 真值配置（含 tdai kernel Bearer），按 .example 自建
 __tests__/offload_server/remote-config.json
