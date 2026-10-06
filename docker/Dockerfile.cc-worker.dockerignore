@@ -1,0 +1,8 @@
+# Build context for docker/Dockerfile.cc-worker only. BuildKit uses this file
+# for that Dockerfile; MemoryCore/Dockerfile builds from MemoryCore/ with its
+# own ignore file.
+# Allow-list: the worker image needs only the entrypoint, so .env, .env.cc,
+# node_modules, MemoryCore/ and everything else stay out (the code is cloned
+# at run time).
+*
+!docker/entrypoint.sh

@@ -1,0 +1,81 @@
+# Claude Code worker for this fork: a fresh GitHub clone per container, the
+# TUI (or the MemoryCore gate / a headless Orca runtime) on top.
+# Build from the repo root:
+#   docker build -f docker/Dockerfile.cc-worker -t tencentdb-agent-memory-cc-worker .
+# Usage and env vars: docs/docker-cc-worker.md
+# MemoryCore/Dockerfile (tdai-gateway, built from MemoryCore/) is the
+# production image; this file is unrelated. Its build context is filtered by
+# Dockerfile.cc-worker.dockerignore next to this file, which BuildKit uses for
+# this build only.
+#
+# Node 22 on bookworm, the same major as MemoryCore/Dockerfile (node:22-slim)
+# and upstream CI, so the container gate runs on the Node the gateway ships on.
+FROM node:22-bookworm-slim
+
+ARG CLAUDE_CODE_VERSION=2.1.283
+# MemoryCore has no lockfile and no packageManager field; this pins only the
+# tool, not the dependency tree, which is resolved at install time.
+ARG PNPM_VERSION=10.26.2
+ARG WORKER_UID=1000
+
+# git + gh (GitHub's apt repo) for clone/push/PR; util-linux ships setpriv,
+# which the entrypoint uses to drop from root to the worker user.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git gnupg util-linux \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# Both land in /usr/local/bin, which Debian's /etc/profile keeps for login
+# shells, so no profile.d PATH fix is needed.
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "pnpm@${PNPM_VERSION}" \
+ && npm cache clean --force
+
+# Headless Orca runtime for the `serve` mode: the host pairs with it as a
+# remote environment, so agents started here can send `worker_done`. The
+# version matches the host's (a mismatch makes every pairing warn). The deb
+# pulls gtk/nss/xvfb; the extra libs below are what Electron still needed on
+# bookworm-slim. The sha256 is the digest GitHub publishes for the asset.
+ARG ORCA_VERSION=1.4.220
+ARG ORCA_DEB_SHA256=5c33e7e1d3ca7f233a9a82dab5e56402651f92ea3cc493f1d68b4c06295fb0ac
+RUN curl -fsSL -o /tmp/orca-ide.deb \
+      "https://github.com/stablyai/orca/releases/download/v${ORCA_VERSION}/orca-ide_${ORCA_VERSION}_amd64.deb" \
+ && echo "${ORCA_DEB_SHA256}  /tmp/orca-ide.deb" | sha256sum -c - \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends /tmp/orca-ide.deb \
+      libgbm1 libasound2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+ && rm -rf /var/lib/apt/lists/* /tmp/orca-ide.deb
+
+# The node image ships a `node` user on uid 1000; replace it with `worker`.
+RUN userdel --remove node \
+ && useradd --create-home --uid "${WORKER_UID}" --shell /bin/bash worker
+
+# Git reads the token from GH_TOKEN at call time through gh; nothing is
+# written to any config.
+RUN git config --system credential.https://github.com.helper '!gh auth git-credential' \
+ && git config --system safe.directory /work
+
+# Baked answers to the dialogs that would otherwise block an unattended TUI:
+# onboarding, folder trust, and the bypass-permissions confirmation.
+RUN mkdir -p /home/worker/.claude /work \
+ && printf '%s\n' '{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{"/work":{"hasTrustDialogAccepted":true}}}' \
+      > /home/worker/.claude.json \
+ && printf '%s\n' '{"skipDangerousModePermissionPrompt":true}' > /home/worker/.claude/settings.json \
+ && chown -R worker:worker /home/worker /work
+
+COPY docker/entrypoint.sh /usr/local/bin/cc-worker-entrypoint
+# A Windows checkout may hand the script over with CRLF; a CRLF shebang fails.
+RUN sed -i 's/\r$//' /usr/local/bin/cc-worker-entrypoint \
+ && chmod 0755 /usr/local/bin/cc-worker-entrypoint
+
+ENV DISABLE_AUTOUPDATER=1 \
+    REPO_URL=https://github.com/vitualpeople/TencentDB-Agent-Memory.git
+
+WORKDIR /work
+# Starts as root; the entrypoint drops to `worker` (uid 1000, empty
+# capability sets) before any repo code or Claude runs.
+ENTRYPOINT ["/usr/local/bin/cc-worker-entrypoint"]
