@@ -2804,7 +2804,26 @@ export class TdaiGateway {
           } catch { /* ok */ }
         }
 
-        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor);
+        const result = await core.runL2WithStore(
+          task.sessionId,
+          store,
+          storage ?? undefined,
+          cursor,
+          {
+            l2TaskId: task.id,
+            signal,
+            teamId,
+            userId: typeof task.data?.userId === "string" ? task.data.userId : undefined,
+            agentId,
+            sessionId: task.sessionId,
+          },
+        );
+        task.data = {
+          ...task.data,
+          l2TaskId: task.id,
+          jevGateId: result.jevGateId,
+          l2SceneDiff: result.sceneDiff,
+        };
 
         // Mark task as skipped if L2 had no new records to process
         if (result.skipped) {
@@ -2858,7 +2877,21 @@ export class TdaiGateway {
 
         core.setInstanceId(instanceId);
         const { store } = await resolveStore(task);
-        const result = await core.runL3WithStore(store, storage ?? undefined);
+        const result = await core.runL3WithStore(
+          store,
+          storage ?? undefined,
+          {
+            l2TaskId: typeof task.data?.l2TaskId === "string" ? task.data.l2TaskId : undefined,
+            l3TaskId: task.id,
+            jevGateId: typeof task.data?.jevGateId === "string" ? task.data.jevGateId : undefined,
+            sceneDiff: task.data?.l2SceneDiff as import("../core/persona/jev-gate.js").L2SceneDiffDiagnostic | undefined,
+            signal,
+            teamId: task.teamId ?? (typeof task.data?.teamId === "string" ? task.data.teamId : undefined),
+            userId: typeof task.data?.userId === "string" ? task.data.userId : undefined,
+            agentId: task.agentId ?? (typeof task.data?.agentId === "string" ? task.data.agentId : undefined),
+            sessionId: task.sessionId,
+          },
+        );
 
         // Report credit + memory (only +1 on first persona creation)
         // provider=proxy 模式下 credit 由 context_proxy 上报，此处仅报 memory delta。
