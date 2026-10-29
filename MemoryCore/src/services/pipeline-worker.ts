@@ -17,6 +17,7 @@
 import type { IStateBackend, TaskPayload } from "../core/state/types.js";
 import { serializeTraceContext } from "../core/report/trace-propagation.js";
 import { obsLogger } from "../core/report/obs-logger.js";
+import { buildPipelineTimerMember } from "../core/state/timer-member.js";
 
 // ============================
 // Types
