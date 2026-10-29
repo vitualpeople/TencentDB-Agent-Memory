@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, mesh-stable]
 
 # Cancel previous runs for the same PR / branch
 concurrency:
@@ -144,6 +144,9 @@ jobs:
   # docs/design/2026-06-16-skill-extract-queue.md
   isolation:
     name: Skill Queue Isolation
+    # mesh-stable carries maintenance fixes to pipeline-worker.ts, one of the
+    # guarded files, so the guard applies to upstream-bound PRs only.
+    if: github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,3 +160,20 @@ jobs:
           git fetch origin "${{ github.base_ref || 'main' }}" --depth=50 || true
           bash scripts/ci/check-skill-queue-isolation.sh
 
+  # ── 8. MemoryCore gate (same command as the cc-worker `test` gate) ──
+  memory-core-gate:
+    name: MemoryCore Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: pnpm install, test, build
+        working-directory: .
+        run: pnpm -C MemoryCore install && pnpm -C MemoryCore test && pnpm -C MemoryCore build

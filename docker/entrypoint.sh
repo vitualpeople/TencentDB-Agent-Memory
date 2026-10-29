@@ -8,6 +8,8 @@
 #                  Claude, no LLM call. The install resolves the dependency
 #                  tree from the registry (MemoryCore has no lockfile) and
 #                  writes MemoryCore/pnpm-lock.yaml, which .gitignore covers.
+#                  With GATE_REF set, a fresh clone first checks out that
+#                  ref (detached) so the gate runs on the PR head.
 #   serve          headless Orca runtime on $ORCA_SERVE_PORT for the host to pair
 #                  with; stdout is its one JSON ready line, stderr goes to
 #                  /tmp/orca-serve.log. Everything it spawns runs as worker.
@@ -52,6 +54,12 @@ else
     # construction.
     if [ -n "${TASK_BRANCH:-}" ]; then
         as_worker git -C "$WORK" checkout --quiet -B "$TASK_BRANCH" "$BASE_REF"
+    fi
+    # GATE_REF pins the tree to a pushed ref (a PR branch head) so `test`
+    # gates that commit instead of the default branch the clone starts on.
+    if [ -n "${GATE_REF:-}" ]; then
+        as_worker git -C "$WORK" fetch --quiet origin "$GATE_REF"
+        as_worker git -C "$WORK" checkout --quiet FETCH_HEAD
     fi
 fi
 
