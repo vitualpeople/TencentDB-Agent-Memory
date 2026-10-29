@@ -22,6 +22,7 @@ export interface HealthResponse {
   stores: {
     vectorStore: boolean;
     embeddingService: boolean;
+    ftsAvailable?: boolean;
   };
   /** Integrated services status (only present when state_backend is configured) */
   services?: {

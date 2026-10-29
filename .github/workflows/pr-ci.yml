@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, mesh-stable]
 
 # Cancel previous runs for the same PR / branch
 concurrency:
@@ -17,6 +17,10 @@ jobs:
   # ── 1. Install dependencies ────────────────────────────────
   install:
     name: Install
+    # npm crashes resolving the mesh-stable tree (arborist "edgesOut" on null);
+    # mesh-stable installs with pnpm in memory-core-gate instead. pack and
+    # size depend on this job and are skipped with it.
+    if: github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +148,9 @@ jobs:
   # docs/design/2026-06-16-skill-extract-queue.md
   isolation:
     name: Skill Queue Isolation
+    # mesh-stable carries maintenance fixes to pipeline-worker.ts, one of the
+    # guarded files, so the guard applies to upstream-bound PRs only.
+    if: github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,3 +164,22 @@ jobs:
           git fetch origin "${{ github.base_ref || 'main' }}" --depth=50 || true
           bash scripts/ci/check-skill-queue-isolation.sh
 
+  # ── 8. MemoryCore gate (same command as the cc-worker `test` gate) ──
+  memory-core-gate:
+    name: MemoryCore Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Same pnpm as docker/Dockerfile.cc-worker (PNPM_VERSION); newer majors
+      # fail the install on the unapproved build scripts in pnpm-workspace.yaml.
+      - name: Enable corepack (pnpm 10.26.2)
+        run: corepack enable && corepack prepare pnpm@10.26.2 --activate
+
+      - name: pnpm install, test, build
+        working-directory: .
+        run: pnpm -C MemoryCore install && pnpm -C MemoryCore test && pnpm -C MemoryCore build

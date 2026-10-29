@@ -716,7 +716,7 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   const ingestBaseMs = Date.now();
 
   for (const [index, msg] of messages.entries()) {
-    const id = `msg-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const id = `msg-${randomUUID().replace(/-/g, "")}`;
     const ingestRecordedAtMs = ingestBaseMs + index;
     const recordedAtMs = msg.recorded_at
       ? new Date(msg.recorded_at).getTime()
