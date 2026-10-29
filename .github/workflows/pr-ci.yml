@@ -17,6 +17,10 @@ jobs:
   # ── 1. Install dependencies ────────────────────────────────
   install:
     name: Install
+    # npm crashes resolving the mesh-stable tree (arborist "edgesOut" on null);
+    # mesh-stable installs with pnpm in memory-core-gate instead. pack and
+    # size depend on this job and are skipped with it.
+    if: github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -171,8 +175,10 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Enable corepack
-        run: corepack enable
+      # Same pnpm as docker/Dockerfile.cc-worker (PNPM_VERSION); newer majors
+      # fail the install on the unapproved build scripts in pnpm-workspace.yaml.
+      - name: Enable corepack (pnpm 10.26.2)
+        run: corepack enable && corepack prepare pnpm@10.26.2 --activate
 
       - name: pnpm install, test, build
         working-directory: .
