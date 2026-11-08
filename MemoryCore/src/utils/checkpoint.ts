@@ -538,6 +538,21 @@ export class CheckpointManager {
     this.logger.info(`[checkpoint] incrementScenesProcessed: scenes_processed=${cp.scenes_processed}`);
   }
 
+  /**
+   * Add memories processed by L2 to the persona trigger counter and the
+   * lifetime total of this checkpoint. Non-positive counts are ignored.
+   */
+  async incrementMemoriesSincePersona(count: number): Promise<void> {
+    if (count <= 0) return;
+    const cp = await this.mutate((cp) => {
+      cp.memories_since_last_persona += count;
+      cp.total_memories_extracted += count;
+    });
+    this.logger.info(
+      `[checkpoint] incrementMemoriesSincePersona: +${count} → memories_since=${cp.memories_since_last_persona}, total=${cp.total_memories_extracted}`,
+    );
+  }
+
   // ============================
   // Per-session helpers — runner state (L0/L1 owned)
   // ============================

@@ -28,6 +28,7 @@
     "read-local-memory": "node ./bin/read-local-memory.mjs",
     "seed-v2": "node ./bin/seed-v2.mjs",
     "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
     "test:oss": "vitest run -c vitest.oss.config.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

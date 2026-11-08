@@ -958,7 +958,10 @@ export function createL2Runner(opts: {
       if (changedProfiles.length === 0) {
         logger.debug?.(`${TAG} [L2] No changed Scene profiles, skipping generation provenance`);
         await checkpoint.incrementScenesProcessed();
-        await checkpoint.incrementMemoriesSincePersona(extractResult.memoriesProcessed);
+        // Root checkpoint: L1 already counted these memories in markL1ExtractionComplete.
+        if (groupDataDir !== pluginDataDir) {
+          await checkpoint.incrementMemoriesSincePersona(extractResult.memoriesProcessed);
+        }
         processedTotal += extractResult.memoriesProcessed;
         continue;
       }
@@ -1003,7 +1006,10 @@ export function createL2Runner(opts: {
           : undefined,
       });
       await checkpoint.incrementScenesProcessed();
-      await checkpoint.incrementMemoriesSincePersona(extractResult.memoriesProcessed);
+      // Root checkpoint: L1 already counted these memories in markL1ExtractionComplete.
+      if (groupDataDir !== pluginDataDir) {
+        await checkpoint.incrementMemoriesSincePersona(extractResult.memoriesProcessed);
+      }
       processedTotal += extractResult.memoriesProcessed;
     }
 
