@@ -49,6 +49,13 @@ export interface RunnerSessionState {
   last_l1_cursor: number;
   /** Last scene name from the most recent L1 extraction (for cross-batch continuity) */
   last_scene_name: string;
+  /**
+   * L0 message ids past `last_l1_cursor` that an earlier run already
+   * extracted, because the cursor had to stop before a failed group that
+   * interleaves with them. The next run skips these ids. Only written by the
+   * opt-in resumeAfterFailedGroup runner; absent otherwise.
+   */
+  l1_done_message_ids?: string[];
 }
 
 /**
@@ -633,10 +640,16 @@ export class CheckpointManager {
     memoriesExtracted: number,
     cursorRecordedAtMs?: number,
     lastSceneName?: string,
+    /** Replace the done-id list (see RunnerSessionState.l1_done_message_ids); undefined leaves it alone, [] clears it. */
+    doneMessageIds?: string[],
   ): Promise<void> {
     let regressed = false;
     await this.mutate((cp) => {
       const state = this.getRunnerState(cp, sessionKey);
+      if (doneMessageIds !== undefined) {
+        if (doneMessageIds.length > 0) state.l1_done_message_ids = doneMessageIds;
+        else delete state.l1_done_message_ids;
+      }
       if (cursorRecordedAtMs) {
         // P0-2: 单调递增，绝不回退。
         //

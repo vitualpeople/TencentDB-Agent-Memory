@@ -17,7 +17,8 @@
 import type { IStateBackend, TaskPayload } from "../core/state/types.js";
 import { serializeTraceContext } from "../core/report/trace-propagation.js";
 import { obsLogger } from "../core/report/obs-logger.js";
-import { buildPipelineTimerMember } from "../core/state/timer-member.js";
+import { buildPipelineTimerMember, L1_DEAD_LETTER_TIMER } from "../core/state/timer-member.js";
+import { isL1ExtractionError } from "../core/record/l1-extraction-error.js";
 
 // ============================
 // Types
@@ -105,6 +106,14 @@ export interface PipelineWorkerConfig {
    * pipeline 一个 consumer。未注入时行为不变。processTask 入口 acquire、finally release。
    */
   permitPool?: import("./worker-permit-pool.js").WorkerPermitPool;
+
+  /**
+   * When > 0, dead-lettering an L1 task arms an L1_dlq timer this many ms
+   * later; the timer scanner turns it into a "dead_letter_retry" L1 task that
+   * re-runs the slice with no new message. 0 (default) keeps the historical
+   * behaviour: the slice is retried only when the session gets a new message.
+   */
+  deadLetterRetryDelayMs?: number;
 }
 
 export interface DeadLetterEntry {
@@ -112,6 +121,8 @@ export interface DeadLetterEntry {
   error: string;
   retryCount: number;
   deadAt: number;
+  /** L1ExtractionError.kind when the last failure was a typed L1 error. */
+  errorKind?: string;
 }
 
 const TAG = "[pipeline-worker]";
@@ -219,6 +230,7 @@ export class PipelineWorker {
       onL2Complete: config?.onL2Complete,
       lockGranularity: config?.lockGranularity ?? "session",
       permitPool: config?.permitPool,
+      deadLetterRetryDelayMs: config?.deadLetterRetryDelayMs ?? 0,
     };
   }
 
@@ -553,6 +565,13 @@ export class PipelineWorker {
 
       this.metrics.tasksFailed++;
 
+      // A typed L1 failure may still carry groups of the slice that finished:
+      // schedule their L2 now, the retry will skip them.
+      const typedL1Error = isL1ExtractionError(err) ? err : undefined;
+      if (typedL1Error && typedL1Error.completedProfileScopes.length > 0) {
+        await this.advanceL2AfterL1(task, typedL1Error.completedProfileScopes);
+      }
+
       // 指数退避重试
       if (retryCount < this.config.maxRetries) {
         const delay = this.config.retryBaseDelayMs * Math.pow(3, retryCount); // 5s, 15s, 45s
@@ -570,7 +589,7 @@ export class PipelineWorker {
         await this.reEnqueue(task, retryCount + 1);
         this.metrics.tasksRetried++;
       } else {
-        await this.moveToDeadLetter(task, errMsg, retryCount);
+        await this.moveToDeadLetter(task, errMsg, retryCount, typedL1Error?.kind);
       }
     } finally {
       // Step 6: 停止续约 + 释放锁
@@ -650,17 +669,7 @@ export class PipelineWorker {
         ? ((task as any)._l2ProfileScopes as string[]).filter(Boolean)
         : [];
       const l2Keys = profileScopes.length > 0 ? profileScopes : [task.sessionId];
-      if (this.config.onL1Complete) {
-        for (const l2Key of l2Keys) {
-          try {
-            await this.backend.updateSessionState(task.instanceId, l2Key, { l2_pending_l1_count: 1 }, tid, aid);
-            await this.config.onL1Complete(l2Key, task.instanceId, tid, aid);
-          } catch (err) {
-            this.logger?.warn?.(`${TAG} onL1Complete failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-      }
-      this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L1 done → L2 timer advanced (${l2Keys.join(",")})`);
+      await this.advanceL2AfterL1(task, l2Keys);
     }
 
     if (task.type === "L2") {
@@ -697,6 +706,23 @@ export class PipelineWorker {
       }
       this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L2 done → L3 enqueued`);
     }
+  }
+
+  /** Mark each L2 key pending and advance its L2 timer (onL1Complete). */
+  private async advanceL2AfterL1(task: TaskPayload, l2Keys: string[]): Promise<void> {
+    const tid = task.teamId ?? (task.data as any)?.teamId;
+    const aid = task.agentId ?? (task.data as any)?.agentId;
+    if (this.config.onL1Complete) {
+      for (const l2Key of l2Keys) {
+        try {
+          await this.backend.updateSessionState(task.instanceId, l2Key, { l2_pending_l1_count: 1 }, tid, aid);
+          await this.config.onL1Complete(l2Key, task.instanceId, tid, aid);
+        } catch (err) {
+          this.logger?.warn?.(`${TAG} onL1Complete failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L1 done → L2 timer advanced (${l2Keys.join(",")})`);
   }
 
   // ============================
@@ -788,8 +814,8 @@ export class PipelineWorker {
   // Dead Letter (#13)
   // ============================
 
-  private async moveToDeadLetter(task: TaskPayload, error: string, retryCount: number): Promise<void> {
-    const entry: DeadLetterEntry = { task, error, retryCount, deadAt: Date.now() };
+  private async moveToDeadLetter(task: TaskPayload, error: string, retryCount: number, errorKind?: string): Promise<void> {
+    const entry: DeadLetterEntry = { task, error, retryCount, deadAt: Date.now(), ...(errorKind ? { errorKind } : {}) };
     this.deadLetterQueue.push(entry);
     this.metrics.tasksDeadLettered++;
 
@@ -813,6 +839,18 @@ export class PipelineWorker {
       await this.backend.removeTimer(task.instanceId, buildPipelineTimerMember(task.sessionId, "L1_idle", { teamId: tid, agentId: aid }));
       await this.backend.removeTimer(task.instanceId, buildPipelineTimerMember(task.sessionId, "L2_schedule", { teamId: tid, agentId: aid }));
     } catch { /* best effort */ }
+
+    // Opt-in: arm a delayed re-run of this L1 slice (see deadLetterRetryDelayMs).
+    if (task.type === "L1" && this.config.deadLetterRetryDelayMs > 0) {
+      const tid = task.teamId ?? (task.data as any)?.teamId;
+      const aid = task.agentId ?? (task.data as any)?.agentId;
+      const member = buildPipelineTimerMember(task.sessionId, L1_DEAD_LETTER_TIMER, { teamId: tid, agentId: aid });
+      try {
+        await this.backend.setTimer(task.instanceId, member, entry.deadAt + this.config.deadLetterRetryDelayMs);
+      } catch (err) {
+        this.logger.warn(`${TAG} Failed to arm ${L1_DEAD_LETTER_TIMER} for ${task.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     // 关键节点日志：任务进入死信队列
     obsLogger.error("core.task.dead_letter", {

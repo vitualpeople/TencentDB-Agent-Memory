@@ -120,7 +120,7 @@ import type { TimerScanner } from "../services/timer-scanner.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
 import type { StatefulPipelineManager } from "../utils/stateful-pipeline-manager.js";
 import type { PipelineLogger } from "../utils/pipeline-factory.js";
-import { parsePipelineTimerMember } from "../core/state/timer-member.js";
+import { parsePipelineTimerMember, timerTriggeredBy } from "../core/state/timer-member.js";
 
 const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
@@ -1657,6 +1657,7 @@ export class TdaiGateway {
           let sessionId: string;
           let teamId: string | undefined;
           let agentId: string | undefined;
+          let timerType = "";
 
           const firstColon = member.indexOf(":");
           const prefix = firstColon > 0 ? member.slice(0, firstColon) : member;
@@ -1689,6 +1690,7 @@ export class TdaiGateway {
             const parsed = parsePipelineTimerMember(member);
             sessionId = parsed.sessionId;
             taskType = parsed.taskType;
+            timerType = parsed.timerType;
             teamId = parsed.teamId;
             agentId = parsed.agentId;
             instanceId = entry.instanceId ?? this.config.instanceId ?? "default";
@@ -1709,7 +1711,7 @@ export class TdaiGateway {
             agentId,
             priority: 0,
             createdAt: now,
-            data: { triggeredBy: "timer_scanner", timerMember: member, instanceId, targetMmdFile, teamId, agentId },
+            data: { triggeredBy: timerTriggeredBy(timerType), timerMember: member, instanceId, targetMmdFile, teamId, agentId },
           };
           this.stateBackend!.enqueueTask(task).then(() => {
             this.logger.info(`[local-timer] Timer fired: ${member} → enqueued ${taskType} task`);

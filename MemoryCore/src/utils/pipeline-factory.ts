@@ -19,6 +19,7 @@ import { MemoryPipelineManager } from "./pipeline-manager.js";
 import type { L2Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
+import { L1ExtractionError } from "../core/record/l1-extraction-error.js";
 import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
 import type { ConversationMessage } from "../core/conversation/l0-recorder.js";
 import { CheckpointManager } from "./checkpoint.js";
@@ -402,6 +403,18 @@ export function createL1Runner(opts: {
    * service 模式下必须提供，否则同 instance 的多节点并发会丢失 L1 游标。
    */
   checkpointLock?: import("./checkpoint.js").CheckpointLockOptions;
+  /**
+   * Let a typed L1ExtractionError out of the extractor instead of treating an
+   * LLM/parse failure as "nothing extracted". Off by default.
+   */
+  throwTypedL1Errors?: boolean;
+  /**
+   * When a group of the slice fails: stop the cursor just before the earliest
+   * failed group, remember the ids of finished groups past that point so the
+   * retry skips them, and throw one L1ExtractionError that carries the
+   * finished groups' profile scopes. Implies throwTypedL1Errors. Off by default.
+   */
+  resumeAfterFailedGroup?: boolean;
 }): (params: { sessionKey: string }) => Promise<{
   processedCount: number;
   storedCount: number;
@@ -412,6 +425,8 @@ export function createL1Runner(opts: {
   profileScopes: string[];
 }> {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, getInstanceId, llmRunner, storage, checkpointLock } = opts;
+  const resumeAfterFailedGroup = opts.resumeAfterFailedGroup === true;
+  const throwTypedL1Errors = resumeAfterFailedGroup || opts.throwTypedL1Errors === true;
   const config = openclawConfig as Record<string, unknown> | undefined;
 
   return async ({ sessionKey }) => {
@@ -508,6 +523,22 @@ export function createL1Runner(opts: {
       // groupBy may have permuted ordering across groups; this is cheap).
       flat.sort((a, b) => (a.recordedAtMs - b.recordedAtMs) || (a.timestamp - b.timestamp));
 
+      // Skip rows an earlier run already extracted past the cursor (only the
+      // resumeAfterFailedGroup runner writes this list).
+      const doneIds = new Set(resumeAfterFailedGroup ? runnerState.l1_done_message_ids ?? [] : []);
+      const recById = new Map(flat.map((m) => [m.id, m.recordedAtMs] as const));
+      /** Done ids still past `cursor`; an id not fetched this round is kept (its time is unknown). */
+      const doneIdsPast = (cursor: number): string[] =>
+        [...doneIds].filter((id) => (recById.get(id) ?? Number.POSITIVE_INFINITY) > cursor);
+      if (doneIds.size > 0) {
+        flat = flat.filter((m) => !doneIds.has(m.id));
+        if (flat.length === 0) {
+          const fetchedMax = Math.max(...recById.values());
+          await checkpoint.markL1ExtractionComplete(sessionKey, 0, fetchedMax, undefined, doneIdsPast(fetchedMax));
+          return { processedCount: 0, storedCount: 0, hasMore: false, hasFullBacklog: false, profileScopes: [] };
+        }
+      }
+
       // ── Step 2: slice the first L1_BATCH_PROCESS rows + same-ms boundary alignment ──
       //
       // To advance the cursor safely we must NOT split a group of rows that
@@ -529,21 +560,31 @@ export function createL1Runner(opts: {
         }
       }
       const processed = flat.slice(0, sliceEnd);
+      // Highest fetched time with nothing unprocessed at or below it: the
+      // processed slice plus done rows that precede the next unprocessed row.
+      // Equals the processed max when no done ids were filtered.
+      const nextUnprocessedMs = sliceEnd < flat.length ? flat[sliceEnd].recordedAtMs : Number.POSITIVE_INFINITY;
+      let coveredMaxMs = 0;
+      for (const rec of recById.values()) {
+        if (rec < nextUnprocessedMs && rec > coveredMaxMs) coveredMaxMs = rec;
+      }
 
       // ── Step 3: re-group sliced messages by isolation tuple + sessionId (chronological within each group) ──
-      const groupMap = new Map<string, { sessionId: string; teamId?: string; taskId?: string; userId: string; agentId: string; messages: ConversationMessage[] }>();
+      type L1Group = { sessionId: string; teamId?: string; taskId?: string; userId: string; agentId: string; messages: ConversationMessage[]; minRecordedAtMs: number };
+      const groupMap = new Map<string, L1Group>();
       let maxRecordedAtMs = 0;
       for (const m of processed) {
         if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
         const groupKey = `${m.userId}\u0000${m.agentId}\u0000${m.sessionId}`;
         let g = groupMap.get(groupKey);
         if (!g) {
-          g = { sessionId: m.sessionId, teamId: m.teamId, taskId: m.taskId, userId: m.userId, agentId: m.agentId, messages: [] };
+          g = { sessionId: m.sessionId, teamId: m.teamId, taskId: m.taskId, userId: m.userId, agentId: m.agentId, messages: [], minRecordedAtMs: m.recordedAtMs };
           groupMap.set(groupKey, g);
         }
+        if (m.recordedAtMs < g.minRecordedAtMs) g.minRecordedAtMs = m.recordedAtMs;
         g.messages.push({ id: m.id, role: m.role, content: m.content, timestamp: m.timestamp });
       }
-      const groups: Array<{ sessionId: string; teamId?: string; taskId?: string; userId: string; agentId: string; messages: ConversationMessage[] }> = [];
+      const groups: L1Group[] = [];
       for (const group of groupMap.values()) {
         groups.push(group);
       }
@@ -575,7 +616,8 @@ export function createL1Runner(opts: {
       // `now` per round). If hit, see TODO below for cursor-tiebreaker fix.
       // TODO(known-issue): switch to (recorded_at, record_id) composite cursor
       //   to defend against ≥2N rows sharing one recorded_at_ms.
-      const hasUnprocessedInBatch = queriedCount > sliceEnd;
+      // flat.length === queriedCount unless done ids were filtered out above.
+      const hasUnprocessedInBatch = flat.length > sliceEnd;
       const hasFullBacklog = queriedCount === L1_BATCH_QUERY && hasUnprocessedInBatch;
       const hasMore = hasUnprocessedInBatch && !hasFullBacklog;
 
@@ -596,13 +638,17 @@ export function createL1Runner(opts: {
         layer: "l1" as const,
       }));
       const l1Prompts = await resolveMemoryPrompts(vectorStore, l1PromptTargets);
+      const completedGroups: L1Group[] = [];
+      const failedGroups: Array<{ group: L1Group; err: L1ExtractionError }> = [];
 
       for (const group of groups) {
         logger.debug?.(
           `${TAG} [l1] Group sessionId=${group.sessionId || "(empty)"}: ${group.messages.length} messages`,
         );
 
-        const l1Result = await extractL1Memories({
+        let l1Result: Awaited<ReturnType<typeof extractL1Memories>>;
+        try {
+        l1Result = await extractL1Memories({
           messages: group.messages,
           sessionKey,
           sessionId: group.sessionId,
@@ -628,11 +674,18 @@ export function createL1Runner(opts: {
             conflictRecallTopK: cfg.embedding.conflictRecallTopK,
             embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
             llmRunner,
+            throwOnFailure: throwTypedL1Errors,
           },
           logger,
           instanceId: getInstanceId?.(),
           storage,
         });
+        } catch (err) {
+          if (!resumeAfterFailedGroup || !(err instanceof L1ExtractionError)) throw err;
+          failedGroups.push({ group, err });
+          continue;
+        }
+        completedGroups.push(group);
 
         totalExtracted += l1Result.extractedCount;
         totalStored += l1Result.storedCount;
@@ -653,10 +706,41 @@ export function createL1Runner(opts: {
         }
       }
 
+      if (failedGroups.length > 0) {
+        // Groups interleave in recorded time and the checkpoint has one
+        // monotonic cursor, so it may only cover the contiguous prefix that is
+        // done: stop 1 ms before the earliest failed group's first row. Rows of
+        // finished groups past that point are remembered and skipped next time.
+        failedGroups.sort((a, b) => a.group.minRecordedAtMs - b.group.minRecordedAtMs);
+        const stopAt = failedGroups[0].group.minRecordedAtMs - 1;
+        const done = new Set(doneIdsPast(stopAt));
+        for (const g of completedGroups) {
+          for (const m of g.messages) {
+            if ((recById.get(m.id) ?? 0) > stopAt) done.add(m.id);
+          }
+        }
+        await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, stopAt || undefined, lastSceneName, [...done]);
+        const first = failedGroups[0].err;
+        logger.warn(
+          `${TAG} [l1] ${failedGroups.length}/${groups.length} group(s) failed (kind=${first.kind}); ` +
+          `cursor stops at ${stopAt}, ${done.size} done id(s) kept, stored=${totalStored}`,
+        );
+        throw new L1ExtractionError(first.kind, `L1 failed for ${failedGroups.length} group(s): ${first.message}`, {
+          frozenMessageIds: failedGroups.flatMap((f) => f.group.messages.map((m) => m.id).filter((id): id is string => typeof id === "string")),
+          upperBoundMs: maxRecordedAtMs,
+          completedProfileScopes: Array.from(profileScopes),
+          cause: first,
+        });
+      }
+
       // Use maxRecordedAtMs (write time) of the **processed** slice as cursor —
       // always positive, TCVDB-safe. Boundary alignment guarantees we will not
       // skip same-ms siblings on the next round.
-      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, maxRecordedAtMs || undefined, lastSceneName);
+      const cursorMs = resumeAfterFailedGroup ? Math.max(maxRecordedAtMs, coveredMaxMs) : maxRecordedAtMs;
+      await checkpoint.markL1ExtractionComplete(
+        sessionKey, totalStored, cursorMs || undefined, lastSceneName,
+        resumeAfterFailedGroup ? doneIdsPast(cursorMs) : undefined,
+      );
       logger.info(
         `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} (${groups.length} group(s))`,
       );
