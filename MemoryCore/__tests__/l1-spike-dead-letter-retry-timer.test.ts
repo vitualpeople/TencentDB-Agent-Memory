@@ -8,9 +8,11 @@
  * worker.deadLetterRetryDelayMs, default 15 min). A successful re-run consumes
  * the live conversation_count, so the next L1_idle is not an empty run.
  *
- * The runner here throws on its first four calls and then delegates to the
- * real createL1Runner. That isolates this mechanism from the typed errors
- * (making the real runner throw on a provider error).
+ * The runner here throws a typed provider L1ExtractionError on its first
+ * four calls and then delegates to the real createL1Runner, which isolates
+ * this mechanism from how the real runner builds that error. Only a typed
+ * dead-letter arms L1_dlq; an untyped one does not (see
+ * l1-untyped-dead-letter-no-timer-rerun.test.ts).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -26,6 +28,7 @@ vi.mock("../src/core/state/index.js", async (importOriginal) => {
   };
 });
 
+import { L1ExtractionError } from "../src/core/record/l1-extraction-error.js";
 import { LocalStateBackend } from "../src/core/state/local-backend.js";
 import { buildPipelineTimerMember } from "../src/core/state/timer-member.js";
 import type { TaskPayload } from "../src/core/state/types.js";
@@ -35,7 +38,7 @@ import { TimerScanner } from "../src/services/timer-scanner.js";
 import { CheckpointManager } from "../src/utils/checkpoint.js";
 import { createL1Runner } from "../src/utils/pipeline-factory.js";
 import {
-  advance, advanceUntil, armedTimers, gatewayHarness, makeCfg, makeL0Store, msg, providerError, sceneJson, scriptedLlm, silent, tmpDir,
+  advance, advanceUntil, armedTimers, gatewayHarness, makeCfg, makeL0Store, msg, sceneJson, scriptedLlm, silent, tmpDir,
 } from "./helpers/l1-spike-harness.js";
 
 const SESSION = "proj:demo";
@@ -59,7 +62,7 @@ describe("dead letter -> L1_dlq timer -> dead_letter_retry task -> executeL1 run
     const real = createL1Runner({ pluginDataDir: dir, cfg: makeCfg(), openclawConfig: undefined, vectorStore: store as never, embeddingService: undefined, logger: silent, llmRunner: runner });
     let calls = 0;
     const runL1 = vi.fn(async (sessionKey: string) => {
-      if (++calls <= 4) throw providerError(503);
+      if (++calls <= 4) throw new L1ExtractionError("provider", "LLM API call failed: HTTP 503");
       return real({ sessionKey });
     });
     const { backend, executor } = await gatewayHarness({
