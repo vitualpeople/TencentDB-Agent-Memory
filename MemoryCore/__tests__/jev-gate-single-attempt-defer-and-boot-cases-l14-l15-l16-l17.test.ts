@@ -70,10 +70,10 @@ afterEach(() => {
 
 describe("L14 Jev gate call", () => {
   it.each([
-    ["all three set", { TDAI_JEV_API_KEY: "k-tdai", TYPESAFE_API_KEY: "k-typesafe", OPENROUTER_API_KEY: "k-or" }, "k-tdai"],
-    ["TYPESAFE + OPENROUTER", { TYPESAFE_API_KEY: "k-typesafe", OPENROUTER_API_KEY: "k-or" }, "k-typesafe"],
-    ["OPENROUTER only", { OPENROUTER_API_KEY: "k-or" }, "k-or"],
-  ])("L14 key order (%s) -> %s", (_label, keys, expected) => {
+    ["all three set", "TDAI_JEV_API_KEY", { TDAI_JEV_API_KEY: "k-tdai", TYPESAFE_API_KEY: "k-typesafe", OPENROUTER_API_KEY: "k-or" }, "k-tdai"],
+    ["TYPESAFE + OPENROUTER", "TYPESAFE_API_KEY", { TYPESAFE_API_KEY: "k-typesafe", OPENROUTER_API_KEY: "k-or" }, "k-typesafe"],
+    ["OPENROUTER only", "OPENROUTER_API_KEY", { OPENROUTER_API_KEY: "k-or" }, "k-or"],
+  ])("L14 key order (%s) -> the key comes from %s", (_label, _winner, keys, expected) => {
     jevEnv(keys);
     expect(parseConfig({}).persona.jev.apiKey).toBe(expected);
   });
