@@ -15,8 +15,8 @@ export interface ParsedPipelineTimerMember extends PipelineTimerMemberContext {
 const SCOPED_TIMER_PREFIX = "scope:";
 
 /**
- * Timer armed by PipelineWorker when an L1 task is dead-lettered (opt-in via
- * deadLetterRetryDelayMs). Classified as an L1 task like L1_idle, but the
+ * Timer armed by PipelineWorker when an L1 task is dead-lettered (delay:
+ * deadLetterRetryDelayMs, 0 disables). Classified as an L1 task like L1_idle, but the
  * scanners tag it "dead_letter_retry" so executeL1 does not dedup it against
  * conversation_count (which a threshold-fired L1 has already zeroed).
  */

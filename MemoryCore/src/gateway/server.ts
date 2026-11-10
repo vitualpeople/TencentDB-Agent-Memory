@@ -114,7 +114,7 @@ import { LocalStorageBackend } from "../core/storage/local-backend.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import type { TaskPayload } from "../core/state/types.js";
 import type { TaskExecutor } from "../services/pipeline-worker.js";
-import { claimTimerL1Count } from "../services/pipeline-worker.js";
+import { claimTimerL1Count, claimDeadLetterRetryL1Count, type L1FrozenSliceHint } from "../services/pipeline-worker.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { TimerScanner } from "../services/timer-scanner.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
@@ -1851,6 +1851,8 @@ export class TdaiGateway {
     this.pipelineWorker = new PipelineWorker(this.stateBackend, executor, {
       pollIntervalMs: this.config.worker.pollMs,
       concurrency: this.config.worker.concurrency,
+      // Re-run a dead-lettered L1 slice later, with no new message needed
+      deadLetterRetryDelayMs: this.config.worker.deadLetterRetryDelayMs,
       // L1 完成后推进 L2 timer（快路径：L1完成 → delay秒后触发L2）
       onL1Complete: statefulManager.advanceL2TimerAfterL1.bind(statefulManager),
       // L2 完成后设置 maxInterval 兜底 timer
@@ -2707,6 +2709,10 @@ export class TdaiGateway {
             gateway.logger.debug?.(`[executor] L1 skipped: session ${task.sessionId} already processed (count=0)`);
             return;
           }
+        } else if (task.data?.triggeredBy === "dead_letter_retry" && gateway.stateBackend) {
+          // Re-run of a dead-lettered slice: never deduped, but it consumes
+          // the live count so the next L1_idle is not an empty run.
+          await claimDeadLetterRetryL1Count(gateway.stateBackend, task, instanceId, teamId, agentId);
         }
 
         // Credit quota check before LLM call
@@ -2714,9 +2720,17 @@ export class TdaiGateway {
           const check = await gateway.quotaManager.checkCreditQuota(instanceId);
           if (!check.allowed) {
             gateway.logger.warn(`[executor] L1 skipped: credit limit exceeded (instance=${instanceId}, current=${check.current}, limit=${check.limit})`);
+            (task as any)._l1NotRun = true;
             return;
           }
         }
+
+        // Frozen slice of a failing run (PipelineWorker): retry only up to
+        // its bound, or skip it after repeated parse failures.
+        const frozen = (task as any)._l1FrozenSlice as L1FrozenSliceHint | undefined;
+        const slice = frozen
+          ? (frozen.skip ? { skipThroughMs: frozen.upperBoundMs } : { sliceUpperBoundMs: frozen.upperBoundMs })
+          : undefined;
 
         // H-11 Step 2: check again after async quota call before launching LLM
         if (signal?.aborted) throw signal.reason ?? new Error("executeL1: aborted before LLM");
@@ -2730,6 +2744,7 @@ export class TdaiGateway {
           embedding,
           storage ?? undefined,
           resolveCheckpointLock(instanceId),
+          slice,
         );
 
         (task as any)._l2ProfileScopes = result.profileScopes;
@@ -2752,7 +2767,9 @@ export class TdaiGateway {
         // L1_idle timer so a later notifyConversation can co-trigger.
         // See pipeline-factory.ts createL1Runner for the full state machine.
         if (gateway.statefulPipelineManager) {
-          if (result.hasFullBacklog) {
+          // A bounded retry leaves rows past the frozen bound: drain them now,
+          // an L1_idle task would be deduped against the zeroed count.
+          if (result.hasFullBacklog || (slice?.sliceUpperBoundMs !== undefined && result.hasMore)) {
             gateway.statefulPipelineManager.enqueueL1Drain(task.sessionId, instanceId, teamId, agentId).catch((err) => {
               gateway.logger.warn(`[executor] L1 drain enqueue failed: ${err instanceof Error ? err.message : String(err)}`);
             });

@@ -1,9 +1,11 @@
 /**
  * Typed L1 extraction failure.
  *
- * Thrown by extractL1Memories only when the caller opts in with
- * `options.throwOnFailure`; without it the extractor keeps returning
- * `success: false` (LLM error) or an empty result (unparsable reply).
+ * Thrown by extractL1Memories when the LLM call fails or its reply is not a
+ * valid scene array, so the caller can tell "the extraction failed" apart
+ * from "the LLM found no memory" (a valid empty array `[]`). The L1 runner
+ * re-throws one aggregated error per slice; PipelineWorker reads it to retry,
+ * dead-letter and cap slices that keep failing to parse.
  *
  * Kept in its own module so PipelineWorker can recognise it with
  * `instanceof` without importing the extractor and its dependencies.

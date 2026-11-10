@@ -52,8 +52,8 @@ export interface RunnerSessionState {
   /**
    * L0 message ids past `last_l1_cursor` that an earlier run already
    * extracted, because the cursor had to stop before a failed group that
-   * interleaves with them. The next run skips these ids. Only written by the
-   * opt-in resumeAfterFailedGroup runner; absent otherwise.
+   * interleaves with them. The next run skips these ids. Absent when no
+   * such id is pending.
    */
   l1_done_message_ids?: string[];
 }

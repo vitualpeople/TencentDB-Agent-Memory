@@ -131,12 +131,6 @@ export async function extractL1Memories(params: {
      * a CleanContextRunner (decouples from OpenClaw runtime).
      */
     llmRunner?: LLMRunner;
-    /**
-     * Throw L1ExtractionError instead of returning success:false (LLM call
-     * failed) or an empty result (reply not a valid scene array). Off by
-     * default, which keeps the historical swallow-and-continue behaviour.
-     */
-    throwOnFailure?: boolean;
   };
   logger?: Logger;
   /** Plugin instance ID for metric reporting (optional — metrics skipped if absent) */
@@ -204,20 +198,19 @@ export async function extractL1Memories(params: {
       memoryPrompt: options.memoryPrompt,
       traceContext: { teamId, userId, agentId, sessionId },
       llmRunner: options.llmRunner,
-      strict: options.throwOnFailure === true,
     });
     logger?.debug?.(`${TAG} LLM detected ${scenes.length} scene(s)`);
   } catch (err) {
-    logger?.error(`${TAG} LLM extraction failed: ${err instanceof Error ? err.message : String(err)}`);
-    if (options.throwOnFailure) {
-      const frozenMessageIds = messages.map((m) => m.id).filter((id): id is string => typeof id === "string");
-      if (err instanceof L1ExtractionError) {
-        err.frozenMessageIds = frozenMessageIds;
-        throw err;
-      }
-      throw new L1ExtractionError("provider", err instanceof Error ? err.message : String(err), { frozenMessageIds, cause: err });
+    // A failed call or an unusable reply is an error, not "no memories":
+    // the caller must not advance the L1 cursor past these messages.
+    const kind = err instanceof L1ExtractionError ? err.kind : "provider";
+    logger?.error(`${TAG} LLM extraction failed (kind=${kind}): ${err instanceof Error ? err.message : String(err)}`);
+    const frozenMessageIds = messages.map((m) => m.id).filter((id): id is string => typeof id === "string");
+    if (err instanceof L1ExtractionError) {
+      err.frozenMessageIds = frozenMessageIds;
+      throw err;
     }
-    return { success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [] };
+    throw new L1ExtractionError("provider", err instanceof Error ? err.message : String(err), { frozenMessageIds, cause: err });
   }
 
   // Flatten all memories across scenes
@@ -477,10 +470,8 @@ async function callLlmExtraction(params: {
   llmRunner?: LLMRunner;
   /** langfuse 上报身份四元组（team/user/agent/session）。 */
   traceContext?: TraceContext;
-  /** Throw L1ExtractionError("parse") instead of returning [] for a bad reply. */
-  strict?: boolean;
 }): Promise<SceneSegment[]> {
-  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, promptMode = "chat", memoryPrompt, llmRunner, traceContext, strict = false } = params;
+  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, promptMode = "chat", memoryPrompt, llmRunner, traceContext } = params;
 
   const systemPrompt = composeMemorySystemPrompt(getExtractMemoriesSystemPrompt(promptMode), memoryPrompt);
   const userPrompt = formatExtractionPrompt({
@@ -527,14 +518,14 @@ async function callLlmExtraction(params: {
     });
   }
 
-  return parseExtractionResult(result, logger, strict);
+  return parseExtractionResult(result, logger);
 }
 
 /**
  * Parse the LLM's JSON response into SceneSegment array.
  * Expected format: [{scene_name, message_ids, memories: [...]}]
  */
-function parseExtractionResult(raw: string, logger?: Logger, strict = false): SceneSegment[] {
+function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
   try {
     // Strip markdown code block wrappers if present
     let cleaned = raw.trim();
@@ -551,8 +542,7 @@ function parseExtractionResult(raw: string, logger?: Logger, strict = false): Sc
       logger?.warn?.(
         `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${raw.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
       );
-      if (strict) throw new L1ExtractionError("parse", "No JSON array found in extraction response");
-      return [];
+      throw new L1ExtractionError("parse", "No JSON array found in extraction response");
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce.
@@ -572,23 +562,20 @@ function parseExtractionResult(raw: string, logger?: Logger, strict = false): Sc
 
     if (!Array.isArray(parsed)) {
       logger?.warn?.(`${TAG} Extraction response is not an array`);
-      if (strict) throw new L1ExtractionError("parse", "Extraction response is not an array");
-      return [];
+      throw new L1ExtractionError("parse", "Extraction response is not an array");
     }
 
-    if (strict) {
-      // Validate before the lenient coercion below turns a missing
-      // message_ids / memories into [] and an invalid item into a skip.
-      parsed.forEach((item, i) => {
-        const s = item as Record<string, unknown> | null;
-        if (!s || typeof s !== "object" || Array.isArray(s)) {
-          throw new L1ExtractionError("parse", `Extraction item ${i} is not an object`);
-        }
-        if (!Array.isArray(s.message_ids) || !Array.isArray(s.memories)) {
-          throw new L1ExtractionError("parse", `Extraction item ${i} lacks message_ids or memories array`);
-        }
-      });
-    }
+    // Validate before the lenient coercion below turns a missing
+    // message_ids / memories into [] and an invalid item into a skip.
+    parsed.forEach((item, i) => {
+      const s = item as Record<string, unknown> | null;
+      if (!s || typeof s !== "object" || Array.isArray(s)) {
+        throw new L1ExtractionError("parse", `Extraction item ${i} is not an object`);
+      }
+      if (!Array.isArray(s.message_ids) || !Array.isArray(s.memories)) {
+        throw new L1ExtractionError("parse", `Extraction item ${i} lacks message_ids or memories array`);
+      }
+    });
 
     const scenes: SceneSegment[] = [];
     for (const item of parsed) {
@@ -620,10 +607,7 @@ function parseExtractionResult(raw: string, logger?: Logger, strict = false): Sc
     logger?.warn?.(
       `${TAG} [l1-debug] PARSE_FAIL rawLen=${raw.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
     );
-    if (strict) {
-      throw new L1ExtractionError("parse", `Failed to parse extraction result: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
-    }
-    return [];
+    throw new L1ExtractionError("parse", `Failed to parse extraction result: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
 }
 
