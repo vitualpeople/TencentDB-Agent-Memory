@@ -15,14 +15,32 @@ export interface GatewayErrorResponse {
 // /health
 // ============================
 
+/** One provider's health block in /health (see core/report/provider-health-telemetry). */
+export interface ProviderHealthSnapshot {
+  lastOkAt: string | null;
+  lastErrorAt: string | null;
+  /** HTTP status of the last failure, null when it had none (timeout, network, bad body). */
+  lastErrorStatus: number | null;
+  /** Failed calls since the last success; >= 3 makes `status` "degraded". */
+  consecutiveFailures: number;
+}
+
 export interface HealthResponse {
   status: "ok" | "degraded";
   version: string;
   uptime: number;
   stores: {
     vectorStore: boolean;
+    /** Kept for memory-hub, which reads it: true when an embedding service is wired. */
     embeddingService: boolean;
     ftsAvailable?: boolean;
+    /**
+     * Remote embedding calls, all services of the process. Plus the number of
+     * L0 records stored without a vector because their embedding call failed.
+     */
+    embedding: ProviderHealthSnapshot & { l0EmbeddingFailed: number };
+    /** LLM calls of every StandaloneLLMRunner of the process (L1, dedup, L2, L3, skill). */
+    llm: ProviderHealthSnapshot;
   };
   /** Integrated services status (only present when state_backend is configured) */
   services?: {

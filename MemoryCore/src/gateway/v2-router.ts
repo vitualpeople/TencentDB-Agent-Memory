@@ -19,6 +19,7 @@ import type http from "node:http";
 import { classifyError } from "./error-handler.js";
 import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
+import { incrementL0EmbeddingFailed } from "../core/report/provider-health-telemetry.js";
 import { createScopedStorageAdapter, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
@@ -711,17 +712,19 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   const embedding = deps.getEmbedding();
-  const acceptedIds: string[] = [];
-  const acceptedRecords: L0Record[] = [];
+  const records: L0Record[] = [];
+  const embeddings: Array<Float32Array | undefined> = [];
   const ingestBaseMs = Date.now();
 
+  // 1. Build every record and compute its embedding before any write, so the
+  //    write below can be one transaction.
   for (const [index, msg] of messages.entries()) {
     const id = `msg-${randomUUID().replace(/-/g, "")}`;
     const ingestRecordedAtMs = ingestBaseMs + index;
     const recordedAtMs = msg.recorded_at
       ? new Date(msg.recorded_at).getTime()
       : ingestRecordedAtMs;
-    const record: L0Record = {
+    records.push({
       id,
       sessionKey: session_id,
       sessionId: session_id,
@@ -734,17 +737,56 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
       messageText: msg.content,
       recordedAt: new Date(recordedAtMs).toISOString(),
       timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : recordedAtMs,
-    };
+    });
 
+    // An embedding failure keeps the record without a vector (the message is
+    // not lost) and is counted, so /health shows how many need a backfill.
+    // The embedding service's error messages carry the HTTP status and the
+    // body length only, never the provider body (it can echo the API key).
     let emb: Float32Array | undefined;
     if (embedding) {
-      try { emb = await embedding.embed(msg.content); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
+      try {
+        emb = await embedding.embed(msg.content);
+      } catch (e) {
+        incrementL0EmbeddingFailed();
+        deps.logger.warn(
+          `${TAG} L0 embedding failed id=${id}: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}; ` +
+          `stored without vector`,
+        );
+      }
     }
-
-    await store.upsertL0(record, emb);
-    acceptedIds.push(id);
-    acceptedRecords.push(record);
+    embeddings.push(emb);
   }
+
+  // 2. Write. A store with upsertL0Atomic (SQLite) stores the whole request or
+  //    none of it. Other stores fall back to one upsertL0 per record, and an
+  //    id whose write returned false is neither accepted nor counted.
+  const acceptedRecords: L0Record[] = [];
+  if (typeof store.upsertL0Atomic === "function") {
+    try {
+      await store.upsertL0Atomic(records, embeddings);
+    } catch (err) {
+      deps.logger.error(
+        `${TAG} L0 atomic write failed for ${session_id}, ${records.length} record(s) rolled back: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return l0WriteFailedEnvelope(requestId);
+    }
+    acceptedRecords.push(...records);
+  } else {
+    for (const [i, record] of records.entries()) {
+      const ok = await store.upsertL0(record, embeddings[i]);
+      if (ok === false) {
+        deps.logger.warn(`${TAG} L0 write rejected id=${record.id} session=${session_id}`);
+        continue;
+      }
+      acceptedRecords.push(record);
+    }
+    if (acceptedRecords.length === 0) {
+      return l0WriteFailedEnvelope(requestId);
+    }
+  }
+  const acceptedIds = acceptedRecords.map((r) => r.id);
 
   // Notify pipeline: trigger async L1 extraction (service mode).
   // Each role=user message counts as one conversation round for threshold/timer logic.
@@ -807,6 +849,16 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
     requestId,
   );
+}
+
+/**
+ * Envelope for a `conversation/add` whose messages were not stored. Code 500
+ * with no `data`, the generic server-fault code of `error-handler.ts`; the
+ * storage error itself stays in the server log. Retrying the same request is
+ * safe: nothing of it was kept.
+ */
+function l0WriteFailedEnvelope(requestId: string): ApiResponseEnvelope {
+  return errorEnvelope(500, "L0 write failed: no message of this request was stored", requestId);
 }
 
 async function handleConversationQuery(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

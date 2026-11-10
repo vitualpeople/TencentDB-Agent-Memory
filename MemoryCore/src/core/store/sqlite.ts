@@ -1877,60 +1877,7 @@ export class VectorStore implements IMemoryStore {
 
       this.db.exec("BEGIN");
       try {
-        // Legacy callers may omit isolation fields; normalize them to the
-        // same default identity used by schema defaults and query filters.
-        this.stmtL0UpsertMeta.run(
-          record.id,
-          record.sessionKey,
-          record.sessionId || DEFAULT_ISOLATION_ID,
-          (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
-          record.taskId || "",
-          record.role,
-          record.messageText,
-          record.recordedAt,
-          record.timestamp,
-          (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
-          (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
-        );
-
-        if (!skipVec) {
-          // vec0 does not support ON CONFLICT → delete then insert
-          this.stmtL0DeleteVec!.run(record.id);
-          this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), record.recordedAt);
-        } else {
-          this.logger?.debug?.(
-            `${TAG} [L0-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${record.id}`,
-          );
-        }
-
-        // Sync FTS5 (delete + re-insert to handle updates).
-        // user_id / agent_id mirrored into FTS so post-recall isolation
-        // filtering doesn't require a join.
-        if (this.ftsAvailable) {
-          try {
-            this.stmtL0FtsDelete.run(record.id);
-            this.stmtL0FtsInsert.run(
-              tokenizeForFts(record.messageText), // message_text — segmented for indexing
-              record.messageText,                 // message_text_original — raw for display
-              record.id,
-              record.sessionKey,
-              record.sessionId || DEFAULT_ISOLATION_ID,
-              (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
-              record.taskId || "",
-              (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
-              (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
-              record.role,
-              record.recordedAt,
-              record.timestamp,
-            );
-          } catch (ftsErr) {
-            // FTS write failure is non-fatal — log and continue
-            this.logger?.warn(
-              `${TAG} [L0-upsert] FTS write failed (non-fatal) id=${record.id}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
-            );
-          }
-        }
-
+        this.writeL0Rows(record, embedding, skipVec);
         this.db.exec("COMMIT");
       } catch (err) {
         try {
@@ -1945,6 +1892,104 @@ export class VectorStore implements IMemoryStore {
         `${TAG} [L0-upsert] FAILED (non-fatal) id=${record.id}: ${err instanceof Error ? err.message : String(err)}`,
       );
       return false;
+    }
+  }
+
+  /**
+   * Write all records of one request in ONE transaction (all or nothing).
+   *
+   * Unlike `upsertL0`, this throws on any failure after rolling the whole
+   * transaction back, so the caller never sees a partially-stored request.
+   * `embeddings[i]` belongs to `records[i]`; `undefined` or a zero vector
+   * stores that record without a vector, as `upsertL0` does.
+   */
+  upsertL0Atomic(records: L0Record[], embeddings: Array<Float32Array | undefined>): void {
+    if (this.degraded) {
+      throw new Error(`${TAG} [L0-upsert-atomic] store is in degraded mode`);
+    }
+    if (embeddings.length !== records.length) {
+      throw new Error(
+        `${TAG} [L0-upsert-atomic] ${records.length} records but ${embeddings.length} embeddings`,
+      );
+    }
+    this.db.exec("BEGIN");
+    try {
+      records.forEach((record, i) => {
+        const embedding = embeddings[i];
+        const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
+        this.writeL0Rows(record, embedding, skipVec);
+      });
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch { /* ignore rollback errors */ }
+      this.logger?.warn(
+        `${TAG} [L0-upsert-atomic] FAILED, rolled back ${records.length} record(s): ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw err;
+    }
+    this.logger?.debug?.(`${TAG} [L0-upsert-atomic] OK ${records.length} record(s)`);
+  }
+
+  /**
+   * Metadata + vector + FTS rows of one L0 record. Runs inside a transaction
+   * the caller opened (`upsertL0` or `upsertL0Atomic`); throws on failure.
+   */
+  private writeL0Rows(record: L0Record, embedding: Float32Array | undefined, skipVec: boolean): void {
+    // Legacy callers may omit isolation fields; normalize them to the
+    // same default identity used by schema defaults and query filters.
+    this.stmtL0UpsertMeta.run(
+      record.id,
+      record.sessionKey,
+      record.sessionId || DEFAULT_ISOLATION_ID,
+      (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
+      record.taskId || "",
+      record.role,
+      record.messageText,
+      record.recordedAt,
+      record.timestamp,
+      (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
+      (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
+    );
+
+    if (!skipVec) {
+      // vec0 does not support ON CONFLICT → delete then insert
+      this.stmtL0DeleteVec!.run(record.id);
+      this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), record.recordedAt);
+    } else {
+      this.logger?.debug?.(
+        `${TAG} [L0-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${record.id}`,
+      );
+    }
+
+    // Sync FTS5 (delete + re-insert to handle updates).
+    // user_id / agent_id mirrored into FTS so post-recall isolation
+    // filtering doesn't require a join.
+    if (this.ftsAvailable) {
+      try {
+        this.stmtL0FtsDelete.run(record.id);
+        this.stmtL0FtsInsert.run(
+          tokenizeForFts(record.messageText), // message_text — segmented for indexing
+          record.messageText,                 // message_text_original — raw for display
+          record.id,
+          record.sessionKey,
+          record.sessionId || DEFAULT_ISOLATION_ID,
+          (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
+          record.taskId || "",
+          (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
+          (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
+          record.role,
+          record.recordedAt,
+          record.timestamp,
+        );
+      } catch (ftsErr) {
+        // FTS write failure is non-fatal — log and continue
+        this.logger?.warn(
+          `${TAG} [L0-upsert] FTS write failed (non-fatal) id=${record.id}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
+        );
+      }
     }
   }
 

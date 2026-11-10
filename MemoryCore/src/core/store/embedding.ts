@@ -14,6 +14,7 @@
  */
 
 import type { Logger } from "../types.js";
+import { embeddingProviderHealth, type ProviderHealthSink } from "../report/provider-health-telemetry.js";
 
 // ============================
 // Types
@@ -365,10 +366,33 @@ export class LocalEmbeddingService implements EmbeddingService {
 /** Max texts per batch (OpenAI limit is 2048, we use a safe value) */
 const MAX_BATCH_SIZE = 256;
 
-/** Max retries for API calls */
-const MAX_RETRIES = 0;
+/** Max retries for API calls (HTTP 429/5xx, network error, timeout). */
+const MAX_RETRIES = 2;
 /** Default timeout per API call in milliseconds */
 const DEFAULT_API_TIMEOUT_MS = 10_000;
+/** Wait before retry n (0-based) is RETRY_BASE_DELAY_MS * (n + 1): 500 ms, then 1000 ms. */
+const RETRY_BASE_DELAY_MS = 500;
+/**
+ * Upper bound on a server-sent `Retry-After`. Deliberately not the call
+ * timeout: the caller's time budget for one write assumes at most 1 s per wait.
+ */
+const RETRY_AFTER_CAP_MS = 1000;
+
+/**
+ * Wait in ms asked for by a `Retry-After` header (delta-seconds or HTTP-date),
+ * capped at RETRY_AFTER_CAP_MS. Undefined when absent or unparsable.
+ */
+function retryAfterMs(header: string | null): number | undefined {
+  const raw = header?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) {
+    return seconds >= 0 ? Math.min(seconds * 1000, RETRY_AFTER_CAP_MS) : undefined;
+  }
+  const at = Date.parse(raw);
+  if (Number.isNaN(at)) return undefined;
+  return Math.min(Math.max(at - Date.now(), 0), RETRY_AFTER_CAP_MS);
+}
 
 /**
  * Custom error class for embedding API errors that carries HTTP status code.
@@ -385,6 +409,34 @@ class EmbeddingApiError extends Error {
   /** Returns true for 4xx errors that should NOT be retried (excluding 429). */
   isClientError(): boolean {
     return this.httpStatus >= 400 && this.httpStatus < 500 && this.httpStatus !== 429;
+  }
+}
+
+/**
+ * The API answered 2xx with a body that cannot be used: no `data` array, a
+ * count that differs from the number of inputs, or a bad `index`. Not retried:
+ * the same request gets the same answer.
+ */
+class EmbeddingResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmbeddingResponseError";
+  }
+}
+
+/**
+ * A returned vector's length differs from the configured `dimensions`. Storing
+ * it would fail the whole vec0 write, so it is rejected here and the caller
+ * keeps the record without a vector instead.
+ */
+export class EmbeddingDimensionError extends EmbeddingResponseError {
+  readonly expected: number;
+  readonly actual: number;
+  constructor(expected: number, actual: number) {
+    super(`Embedding API returned a ${actual}-dimension vector, configured dimensions=${expected}`);
+    this.name = "EmbeddingDimensionError";
+    this.expected = expected;
+    this.actual = actual;
   }
 }
 
@@ -410,8 +462,13 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly maxInputChars?: number;
   private readonly timeoutMs: number;
   private readonly logger?: Logger;
+  private readonly health: ProviderHealthSink;
 
-  constructor(config: OpenAIEmbeddingConfig, logger?: Logger) {
+  /**
+   * @param health  Telemetry sink read by /health. Defaults to the process-wide
+   *   embedding sink; tests may inject their own.
+   */
+  constructor(config: OpenAIEmbeddingConfig, logger?: Logger, health: ProviderHealthSink = embeddingProviderHealth) {
     if (!config.apiKey) {
       throw new Error("EmbeddingService: apiKey is required for remote provider");
     }
@@ -434,6 +491,7 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     this.maxInputChars = config.maxInputChars && config.maxInputChars > 0 ? config.maxInputChars : undefined;
     this.timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_API_TIMEOUT_MS;
     this.logger = logger;
+    this.health = health;
   }
 
   getDimensions(): number {
@@ -516,63 +574,90 @@ export class OpenAIEmbeddingService implements EmbeddingService {
       );
     }
 
-    // Retry loop with timeout
+    // Retry loop with timeout. HTTP 429/5xx, network errors and timeouts are
+    // retried after a backoff; 4xx (except 429) and unusable 2xx bodies are not.
     let lastError: Error | undefined;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let waitMs = RETRY_BASE_DELAY_MS * (attempt + 1);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutOverride ?? this.timeoutMs);
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutOverride ?? this.timeoutMs);
+        const resp = await fetch(fetchUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
 
-        try {
-          const resp = await fetch(fetchUrl, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
-
-          if (!resp.ok) {
-            const errBody = await resp.text().catch(() => "(unable to read body)");
-            const err = new EmbeddingApiError(
-              `Embedding API error: HTTP ${resp.status} ${resp.statusText} — ${errBody.slice(0, 500)}`,
-              resp.status,
-            );
-            // Don't retry on 4xx client errors (except 429 rate limit)
-            if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
-              throw err;
-            }
-            lastError = err;
-            continue;
-          }
-
+        if (!resp.ok) {
+          // The body is read only for its length: provider error bodies can
+          // echo part of the API key, so it never enters a message or log.
+          const errBody = await resp.text().catch(() => "");
+          const err = new EmbeddingApiError(
+            `Embedding API error: HTTP ${resp.status} ${resp.statusText} (body ${errBody.length} bytes)`,
+            resp.status,
+          );
+          if (err.isClientError()) throw err;
+          lastError = err;
+          waitMs = retryAfterMs(resp.headers.get("retry-after")) ?? waitMs;
+        } else {
           const json = (await resp.json()) as OpenAIEmbeddingResponse;
-
-          if (!json.data || !Array.isArray(json.data)) {
-            throw new Error("Embedding API returned unexpected format: missing 'data' array");
-          }
-
-          // Sort by index to ensure correct order, then sanitize+normalize for consistency with local provider
-          const sorted = [...json.data].sort((a, b) => a.index - b.index);
-          return sorted.map((d) => sanitizeAndNormalize(d.embedding));
-        } finally {
-          clearTimeout(timeoutId);
+          const vectors = this.toVectors(json, texts.length);
+          this.health.recordSuccess();
+          return vectors;
         }
       } catch (err) {
-        // Non-retryable errors (4xx client errors) — rethrow immediately
-        if (err instanceof EmbeddingApiError && err.isClientError()) {
+        if ((err instanceof EmbeddingApiError && err.isClientError()) || err instanceof EmbeddingResponseError) {
+          this.health.recordFailure(err instanceof EmbeddingApiError ? err.httpStatus : null);
           throw err;
         }
+        // AbortError = timeout, or a network error: retry
         lastError = err instanceof Error ? err : new Error(String(err));
-        // AbortError = timeout, retry
-        if (attempt < MAX_RETRIES) {
-          // Exponential backoff: 500ms, 1000ms
-          const delay = 500 * (attempt + 1);
-          await new Promise((r) => setTimeout(r, delay));
-        }
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, waitMs));
       }
     }
 
-    throw lastError ?? new Error("Embedding API call failed after retries");
+    const finalError = lastError ?? new Error("Embedding API call failed after retries");
+    this.health.recordFailure(finalError instanceof EmbeddingApiError ? finalError.httpStatus : null);
+    throw finalError;
+  }
+
+  /**
+   * Validate a 2xx body and return one vector per input, in input order.
+   * Checks, in order: a `data` array, one entry per input, every `index` an
+   * integer in range and unique, then every vector's length against the
+   * configured dimensions.
+   */
+  private toVectors(json: OpenAIEmbeddingResponse, expected: number): Float32Array[] {
+    if (!json || !Array.isArray(json.data)) {
+      throw new EmbeddingResponseError("Embedding API returned unexpected format: missing 'data' array");
+    }
+    if (json.data.length !== expected) {
+      throw new EmbeddingResponseError(
+        `Embedding API returned ${json.data.length} embeddings, expected ${expected} embedding(s)`,
+      );
+    }
+    const slots: Array<number[] | undefined> = new Array(expected);
+    for (const item of json.data) {
+      const idx = item?.index;
+      if (!Number.isInteger(idx) || idx < 0 || idx >= expected || slots[idx] !== undefined) {
+        throw new EmbeddingResponseError(`Embedding API returned an out-of-range or duplicate index: ${String(idx)}`);
+      }
+      const emb = item.embedding;
+      if (!Array.isArray(emb)) {
+        throw new EmbeddingResponseError(`Embedding API returned no embedding array at index ${idx}`);
+      }
+      if (emb.length !== this.dims) {
+        throw new EmbeddingDimensionError(this.dims, emb.length);
+      }
+      slots[idx] = emb;
+    }
+    // Sanitize + normalize for consistency with the local provider
+    return slots.map((v) => sanitizeAndNormalize(v!));
   }
 }
 
