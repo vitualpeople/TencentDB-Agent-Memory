@@ -46,6 +46,11 @@ import type {
   SeedResponse,
   GatewayErrorResponse,
 } from "./types.js";
+import {
+  embeddingProviderHealth,
+  getL0EmbeddingFailed,
+  llmProviderHealth,
+} from "../core/report/provider-health-telemetry.js";
 import type { Logger } from "../core/types.js";
 import { InstanceConfigProvider } from "../core/instance-config-provider.js";
 import { wrapWithTrace } from "../core/report/trace-middleware.js";
@@ -1374,8 +1379,11 @@ export class TdaiGateway {
   }
 
   private handleHealth(res: http.ServerResponse): void {
+    // Provider blocks come from the process-wide sinks every embedding service
+    // and LLM runner reports into. Only statuses and times: never a body.
+    const providersDegraded = embeddingProviderHealth.isDegraded() || llmProviderHealth.isDegraded();
     const response: HealthResponse = {
-      status: this.core.getVectorStore() ? "ok" : "degraded",
+      status: this.core.getVectorStore() && !providersDegraded ? "ok" : "degraded",
       version: VERSION,
       uptime: Math.floor((Date.now() - this.startTime) / 1000),
       stores: {
@@ -1385,6 +1393,8 @@ export class TdaiGateway {
         // compiled into every official Node build (e.g. v22.13.1). When
         // false, recall degrades to embedding-only.
         ftsAvailable: this.core.getVectorStore()?.isFtsAvailable() ?? false,
+        embedding: { ...embeddingProviderHealth.snapshot(), l0EmbeddingFailed: getL0EmbeddingFailed() },
+        llm: llmProviderHealth.snapshot(),
       },
       // Integrated services status
       services: {

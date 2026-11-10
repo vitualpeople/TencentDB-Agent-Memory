@@ -595,6 +595,14 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── L0 Write ─────────────────────────────────────────────
 
   upsertL0(record: L0Record, embedding?: Float32Array): MaybePromise<boolean>;
+  /**
+   * Write every record of one request in a single transaction: all of them
+   * are stored or none is. Throws on failure (unlike `upsertL0`, which
+   * returns `false`). `embeddings[i]` belongs to `records[i]`; `undefined`
+   * stores that record without a vector. Optional: callers fall back to
+   * `upsertL0` per record when a backend does not implement it.
+   */
+  upsertL0Atomic?(records: L0Record[], embeddings: Array<Float32Array | undefined>): MaybePromise<void>;
   /** Update only the vector embedding for an existing L0 record (sqlite background path). */
   updateL0Embedding?(recordId: string, embedding: Float32Array): MaybePromise<boolean>;
   deleteL0(recordId: string, filter?: IsolationFilter): MaybePromise<boolean>;

@@ -21,6 +21,7 @@ import path from "node:path";
 import { APICallError, generateText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
+import { llmProviderHealth, type ProviderHealthSink } from "../../core/report/provider-health-telemetry.js";
 import type {
   LLMRunner,
   LLMRunParams,
@@ -242,6 +243,8 @@ export class StandaloneLLMRunner implements LLMRunner {
   private model: string;
   private enableTools: boolean;
   private logger?: Logger;
+  /** Sink read by /health; shared by every runner in the process unless injected. */
+  private health: ProviderHealthSink;
 
   /**
    * Side-channel: 最近一次 run() 调用的 token usage。
@@ -255,11 +258,17 @@ export class StandaloneLLMRunner implements LLMRunner {
     model?: string;
     enableTools?: boolean;
     logger?: Logger;
+    /**
+     * Provider health sink. Defaults to the process-wide LLM sink, so every
+     * runner (L1, dedup, L2, L3, skill, seed) reports into the one /health reads.
+     */
+    health?: ProviderHealthSink;
   }) {
     this.config = opts.config;
     this.model = opts.model ?? opts.config.model;
     this.enableTools = opts.enableTools ?? false;
     this.logger = opts.logger;
+    this.health = opts.health ?? llmProviderHealth;
   }
 
   async run(params: LLMRunParams): Promise<string> {
@@ -339,6 +348,7 @@ export class StandaloneLLMRunner implements LLMRunner {
 
       const text = (result.text ?? "").trim();
       const totalMs = Date.now() - runStartMs;
+      this.health.recordSuccess();
 
       // 暴露 token usage 到 side-channel（供 MetricTrackingRunner 读取）
       if (result.usage) {
@@ -405,6 +415,10 @@ export class StandaloneLLMRunner implements LLMRunner {
         errMsg += ` (status=${err.statusCode ?? "?"}, url=${err.url}${bodyPreview ? `, body=${bodyPreview}${body.length > 2048 ? `...(+${body.length - 2048})` : ""}` : ""})`;
       }
       this.logger?.error(`${TAG} run() failed after ${totalMs}ms: ${errMsg}`);
+      // A caller abort (lost lock, shutdown) says nothing about the provider.
+      if (!params.abortSignal?.aborted) {
+        this.health.recordFailure(APICallError.isInstance(err) ? err.statusCode : null);
+      }
 
       if (params.instanceId) {
         report("llm_call", {
@@ -433,6 +447,8 @@ export interface StandaloneLLMRunnerFactoryOptions {
   config: StandaloneLLMConfig;
   /** Logger instance. */
   logger?: Logger;
+  /** Provider health sink handed to every runner (default: process-wide LLM sink). */
+  health?: ProviderHealthSink;
 }
 
 /**
@@ -443,10 +459,12 @@ export interface StandaloneLLMRunnerFactoryOptions {
 export class StandaloneLLMRunnerFactory implements LLMRunnerFactory {
   private config: StandaloneLLMConfig;
   private logger?: Logger;
+  private health: ProviderHealthSink;
 
   constructor(opts: StandaloneLLMRunnerFactoryOptions) {
     this.config = opts.config;
     this.logger = opts.logger;
+    this.health = opts.health ?? llmProviderHealth;
   }
 
   createRunner(opts?: LLMRunnerCreateOptions): LLMRunner {
@@ -469,6 +487,7 @@ export class StandaloneLLMRunnerFactory implements LLMRunnerFactory {
       model,
       enableTools,
       logger: this.logger,
+      health: this.health,
     });
   }
 }
