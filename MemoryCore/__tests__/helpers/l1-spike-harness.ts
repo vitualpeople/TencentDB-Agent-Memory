@@ -149,20 +149,28 @@ export function armedTimers(backend: LocalStateBackend): Map<string, number> {
   return out;
 }
 
-/** Advance fake timers in steps, letting real I/O (fs) settle between steps. */
+/** Real setTimeout, captured before any test installs fake timers. */
+const realSetTimeout = globalThis.setTimeout;
+/** Let real I/O (checkpoint and JSONL fs writes) finish while the fake clock stands still. */
+async function settleRealIo(): Promise<void> {
+  for (let i = 0; i < 3; i++) await new Promise((r) => realSetTimeout(r, 2));
+}
+
+/** Advance fake timers in steps, letting real I/O settle between steps. */
 export async function advance(ms: number, step = 500): Promise<void> {
   for (let done = 0; done < ms; done += step) {
     await vi.advanceTimersByTimeAsync(Math.min(step, ms - done));
-    await new Promise((r) => setImmediate(r));
+    await settleRealIo();
   }
 }
 
 /** Advance fake time until `cond()` holds or `maxMs` elapses. */
 export async function advanceUntil(cond: () => boolean, maxMs: number, step = 500): Promise<boolean> {
   for (let done = 0; done < maxMs; done += step) {
+    await settleRealIo();
     if (cond()) return true;
     await vi.advanceTimersByTimeAsync(step);
-    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
   }
+  await settleRealIo();
   return cond();
 }
