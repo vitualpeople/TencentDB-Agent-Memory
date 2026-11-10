@@ -1,11 +1,8 @@
 /**
- * Spike, mechanism 3: a typed L1ExtractionError travels from the extractor,
- * through createL1Runner and the gateway executor, to the PipelineWorker,
- * which can tell a provider failure from an unparsable reply.
- *
- * Opt-in: extractL1Memories({ options: { throwOnFailure: true } }) and
- * createL1Runner({ throwTypedL1Errors: true }). With the flags off the
- * behaviour recorded in l1-failure-path-current-behavior.test.ts is unchanged.
+ * Typed L1 errors: an L1ExtractionError travels from the extractor, through
+ * createL1Runner and the gateway executor, to the PipelineWorker, which can
+ * tell a provider failure from an unparsable reply. A valid empty array is
+ * a success ("no memory"), never an error.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractL1Memories } from "../src/core/record/l1-extractor.js";
@@ -23,11 +20,11 @@ async function extractWith(reply: () => string): Promise<unknown> {
   const { runner } = scriptedLlm(reply);
   return extractL1Memories({
     messages, sessionKey: "proj:demo", sessionId: "s", baseDir: tmpDir("l1-typed-"), config: undefined, logger: silent,
-    options: { enableDedup: false, llmRunner: runner, throwOnFailure: true } as never,
+    options: { enableDedup: false, llmRunner: runner },
   }).then(() => undefined, (err: unknown) => err);
 }
 
-describe("extractor throws L1ExtractionError when throwOnFailure is set", () => {
+describe("extractor throws L1ExtractionError on a failed call or an unusable reply", () => {
   it.each([
     ["401", () => { throw providerError(401); }],
     ["429", () => { throw providerError(429); }],
@@ -79,8 +76,8 @@ describe("the worker receives the typed error from the real runner", () => {
     const { runner, run } = scriptedLlm(reply as () => string);
     const l1 = createL1Runner({
       pluginDataDir: dir, cfg: makeCfg(), openclawConfig: undefined, vectorStore: store as never, embeddingService: undefined,
-      logger: silent, llmRunner: runner, throwTypedL1Errors: true,
-    } as never);
+      logger: silent, llmRunner: runner,
+    });
     const seen: unknown[] = [];
     const backend = new LocalStateBackend();
     const worker = new PipelineWorker(backend, {
@@ -100,6 +97,7 @@ describe("the worker receives the typed error from the real runner", () => {
     const dlq = worker.getDeadLetterQueue();
     expect(dlq).toHaveLength(1);
     expect((dlq[0] as { errorKind?: string }).errorKind).toBe(kind);
+    expect(worker.getMetrics().l1ExtractionFailed).toBe(4);
     await worker.stop();
   });
 });

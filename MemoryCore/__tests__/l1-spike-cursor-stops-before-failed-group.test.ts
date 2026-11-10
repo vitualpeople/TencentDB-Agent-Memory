@@ -1,12 +1,10 @@
 /**
- * Spike, mechanism 1: when one group of an L1 slice fails, the cursor stops
+ * Cursor on a failed group: when one group of an L1 slice fails, the cursor stops
  * just before the earliest failed group, the message ids of groups that did
  * finish are remembered so the retry skips them, and the profile scopes of
  * those finished groups still reach the worker so their L2 is scheduled.
- *
- * Opt-in: createL1Runner({ resumeAfterFailedGroup: true }) (implies the typed
- * errors of mechanism 3). With the flag off, fact (c) in
- * l1-failure-path-current-behavior.test.ts still holds.
+ * Retrying never re-extracts (and re-writes, record ids are random) a
+ * finished group.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -59,8 +57,8 @@ function llmFailingFor(failingId: string, down: () => boolean) {
 function runnerFor(dir: string, store: unknown, llmRunner: unknown) {
   return createL1Runner({
     pluginDataDir: dir, cfg: makeCfg(), openclawConfig: undefined, vectorStore: store as never, embeddingService: undefined,
-    logger: silent, llmRunner: llmRunner as never, resumeAfterFailedGroup: true,
-  } as never);
+    logger: silent, llmRunner: llmRunner as never,
+  });
 }
 
 async function runnerState(dir: string) {
@@ -68,7 +66,7 @@ async function runnerState(dir: string) {
 }
 
 describe("runner: cursor stops before the earliest failed group", () => {
-  it("group one (earliest) fails: cursor = its first row - 1, group two kept as done, retry writes group one only", async () => {
+  it("group one (earliest, first pending row) fails: cursor stays put, group two kept as done, retry writes group one only", async () => {
     const dir = tmpDir("l1-resume-1-");
     const { store, l1Records } = makeL0Store(interleavedRows());
     let down = true;
@@ -82,7 +80,7 @@ describe("runner: cursor stops before the earliest failed group", () => {
     expect(err?.completedProfileScopes).toEqual([keyB]);
     expect(l1Records.map((r) => r.sessionId)).toEqual(["sess-b"]);
     let st = await runnerState(dir);
-    expect(st.last_l1_cursor).toBe(1_000);
+    expect(st.last_l1_cursor).toBe(0);
     expect(st.l1_done_message_ids).toEqual(["L0-b1", "L0-b2"]);
 
     down = false;
@@ -96,7 +94,7 @@ describe("runner: cursor stops before the earliest failed group", () => {
     expect(st.l1_done_message_ids ?? []).toEqual([]);
   });
 
-  it("group two fails: cursor = its first row - 1, only group one's rows past the cursor are kept as done", async () => {
+  it("group two fails: cursor = last row before it (<= its first row - 1), only group one's rows past the cursor are kept as done", async () => {
     const dir = tmpDir("l1-resume-2-");
     const { store, l1Records } = makeL0Store(interleavedRows());
     let down = true;

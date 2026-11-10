@@ -1,15 +1,16 @@
 /**
- * Records how the L1 failure path behaves today, so a later fix has a fixed
- * point to change against. Each block states one fact:
+ * The L1 failure path, one fact per block. (a) and (b) are unchanged facts;
+ * (c) and (d) used to record the swallow-and-skip behaviour and now pin the
+ * fixed one:
  *   (a) L1 groups of one slice interleave in recorded time, while the
  *       checkpoint keeps a single monotonic cursor per session key.
- *   (b) a timer-fired L1 task always carries triggeredBy "timer_scanner", and
- *       claimTimerL1Count skips it when conversation_count is 0.
- *   (c) the extractor turns an LLM error into an untyped success:false and an
- *       unparsable reply into [] (success:true); the runner advances the
- *       cursor past either.
- *   (d) moveToDeadLetter removes the session's L1_idle timer and nothing
- *       reads the dead-letter queue back.
+ *   (b) a timer-fired L1 task (L1_idle) carries triggeredBy "timer_scanner",
+ *       and claimTimerL1Count skips it when conversation_count is 0.
+ *   (c) an LLM error or an unparsable reply is an L1ExtractionError (kind
+ *       "provider" / "parse"); the runner throws it and does not move the
+ *       cursor past the failed rows. A valid empty array is still a success.
+ *   (d) moveToDeadLetter removes the session's L1_idle timer and arms an
+ *       L1_dlq timer (default 15 min) that re-runs the slice.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -28,6 +29,7 @@ vi.mock("../src/core/state/index.js", async (importOriginal) => {
   };
 });
 
+import { L1ExtractionError } from "../src/core/record/l1-extraction-error.js";
 import { extractL1Memories } from "../src/core/record/l1-extractor.js";
 import { LocalStateBackend } from "../src/core/state/local-backend.js";
 import { buildPipelineTimerMember } from "../src/core/state/timer-member.js";
@@ -118,29 +120,54 @@ describe("(b) timer-fired L1 tasks are always timer_scanner and are skipped at c
   });
 });
 
-describe("(c) the extractor swallows LLM and parse failures; the runner advances past them", () => {
+describe("(c) LLM and parse failures are typed errors; the runner keeps the cursor", () => {
   const base = { sessionKey: SESSION, sessionId: "s", baseDir: "", config: undefined, logger: silent };
   const messages = [{ id: "m1", role: "user" as const, content: msg("charlie"), timestamp: 1 }];
+  const failures: Array<[string, "provider" | "parse", () => string]> = [
+    ["LLM error 401", "provider", () => { throw providerError(401); }],
+    ["LLM error 429", "provider", () => { throw providerError(429); }],
+    ["LLM error 500", "provider", () => { throw providerError(500); }],
+    ["abort", "provider", () => { throw Object.assign(new Error("The operation was aborted"), { name: "AbortError" }); }],
+    ["timeout", "provider", () => { throw Object.assign(new Error("LLM request timed out after 120000ms"), { name: "TimeoutError" }); }],
+    ["prose, no JSON array", "parse", () => "Sorry, I cannot help with that."],
+    ["broken JSON", "parse", () => "[{\"scene_name\": \"x\", \"memories\": [ {\"content\": "],
+    ["JSON cut mid-array", "parse", () => "[{\"scene_name\":\"x\",\"message_ids\":[\"m1\"],\"memories\":[{\"content\":\"a\"}]},{\"scene_"],
+    ["array of a bare object", "parse", () => "[{}]"],
+  ];
+  const sessionRows = (): L0Row[] => [
+    { id: "L0-c1", sessionId: "sess-c", content: msg("charlie one"), timestamp: 10, recordedAtMs: 601 },
+    { id: "L0-c2", sessionId: "sess-c", content: msg("charlie two"), timestamp: 20, recordedAtMs: 602 },
+  ];
 
-  it.each([401, 429, 500])("LLM error %s -> success:false with no error kind or message", async (status) => {
-    const { runner } = scriptedLlm(() => { throw providerError(status); });
-    const res = await extractL1Memories({ ...base, baseDir: tmpDir("l1-fact-c-"), messages, options: { enableDedup: false, llmRunner: runner } });
-    expect(res).toEqual({ success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [] });
+  it.each(failures)("%s -> extractor throws L1ExtractionError kind %s", async (_label, kind, reply) => {
+    const { runner } = scriptedLlm(reply);
+    const err = await extractL1Memories({ ...base, baseDir: tmpDir("l1-fact-c-"), messages, options: { enableDedup: false, llmRunner: runner } })
+      .then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf(L1ExtractionError);
+    expect((err as L1ExtractionError).kind).toBe(kind);
   });
 
-  it.each([
-    ["prose, no JSON array", "Sorry, I cannot help with that."],
-    ["broken JSON", "[{\"scene_name\": \"x\", \"memories\": [ {\"content\": "],
-    ["array of a bare object", "[{}]"],
-  ])("unparsable reply (%s) -> success:true with nothing extracted", async (_label, reply) => {
-    const { runner } = scriptedLlm(() => reply);
-    const res = await extractL1Memories({ ...base, baseDir: tmpDir("l1-fact-c2-"), messages, options: { enableDedup: false, llmRunner: runner } });
-    expect(res.success).toBe(true);
-    expect(res.extractedCount).toBe(0);
+  it.each(failures)("%s -> runner throws kind %s and the session cursor does not move", async (_label, kind, reply) => {
+    const dir = tmpDir("l1-fact-c2-");
+    await new CheckpointManager(dir, silent).markL1ExtractionComplete(SESSION, 0, 500);
+    const { store, l1Records } = makeL0Store(sessionRows());
+    const { runner } = scriptedLlm(reply);
+    const run = createL1Runner({ pluginDataDir: dir, cfg: makeCfg(), openclawConfig: undefined, vectorStore: store as never, embeddingService: undefined, logger: silent, llmRunner: runner });
+
+    const err = await run({ sessionKey: SESSION }).then(() => undefined, (e: unknown) => e);
+
+    expect(err).toBeInstanceOf(L1ExtractionError);
+    expect((err as L1ExtractionError).kind).toBe(kind);
+    expect(l1Records).toHaveLength(0);
+    expect((await new CheckpointManager(dir, silent).read()).runner_states[SESSION].last_l1_cursor).toBe(500);
   });
 
-  it("a group whose LLM call fails is skipped for good: the cursor still moves to the slice max", async () => {
-    const dir = tmpDir("l1-fact-c3-");
+  // A valid empty array and a valid scene still advance the cursor:
+  // l1-success-and-empty-array-advance-cursor.test.ts (kept free of the error
+  // module so it runs unchanged on the code before the fix).
+
+  it("a group whose LLM call fails is kept: the cursor does not pass it and the runner throws", async () => {
+    const dir = tmpDir("l1-fact-c4-");
     const { store, l1Records } = makeL0Store(interleavedRows());
     const { runner } = scriptedLlm((prompt) => {
       if (prompt.includes("L0-a1")) throw providerError(503);
@@ -148,18 +175,17 @@ describe("(c) the extractor swallows LLM and parse failures; the runner advances
     });
     const run = createL1Runner({ pluginDataDir: dir, cfg: makeCfg(), openclawConfig: undefined, vectorStore: store as never, embeddingService: undefined, logger: silent, llmRunner: runner });
 
-    const out = await run({ sessionKey: SESSION });
+    await expect(run({ sessionKey: SESSION })).rejects.toBeInstanceOf(L1ExtractionError);
 
     expect(l1Records.map((r) => r.sessionId)).toEqual(["sess-b"]);
-    expect(out.processedCount).toBe(4);
-    expect((await new CheckpointManager(dir, silent).read()).runner_states[SESSION].last_l1_cursor).toBe(1_004);
+    expect((await new CheckpointManager(dir, silent).read()).runner_states[SESSION].last_l1_cursor).toBe(0);
   });
 });
 
-describe("(d) dead letter clears L1_idle and nothing reads the dead-letter queue back", () => {
+describe("(d) dead letter clears L1_idle and arms a delayed L1_dlq re-run", () => {
   afterEach(() => { vi.useRealTimers(); });
 
-  it("after 1 + 3 failed runs the task is dead-lettered, no timer is left and no L1 runs again", async () => {
+  it("after 1 + 3 failed runs the task is dead-lettered, L1_idle is gone and L1_dlq fires 15 min later by default", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const fired: string[] = [];
     const backend = new LocalStateBackend({ onTimerExpired: (e) => { fired.push(e.member); } });
@@ -169,6 +195,7 @@ describe("(d) dead letter clears L1_idle and nothing reads the dead-letter queue
       async executeL2() {}, async executeL3() {},
     }, { concurrency: 1, pollIntervalMs: 200, lockRenewIntervalMs: 60_000 }, silent);
     const idle = buildPipelineTimerMember(SESSION, "L1_idle", { agentId: "default" });
+    const dlq = buildPipelineTimerMember(SESSION, "L1_dlq", { agentId: "default" });
     await backend.setTimer("svc", idle, Date.now() + 10 * 60_000);
     await worker.start();
     await backend.enqueueTask({ id: "L1-1", type: "L1", instanceId: "svc", sessionId: SESSION, agentId: "default", priority: 0, createdAt: Date.now(), data: { instanceId: "svc", agentId: "default" } });
@@ -176,11 +203,12 @@ describe("(d) dead letter clears L1_idle and nothing reads the dead-letter queue
     await advance(5_000 + 15_000 + 45_000 + 5_000);
     expect(runs).toBe(4);
     expect(worker.getMetrics().tasksDeadLettered).toBe(1);
-    expect(armedTimers(backend).size).toBe(0);
+    const timers = armedTimers(backend);
+    expect(timers.has(idle)).toBe(false);
+    expect(timers.get(dlq)).toBe(worker.getDeadLetterQueue()[0].deadAt + 15 * 60_000);
 
-    await advance(2 * 60 * 60_000, 60_000);
-    expect(runs).toBe(4);
-    expect(fired).toEqual([]);
+    await advance(15 * 60_000, 60_000);
+    expect(fired).toEqual([dlq]);
     await worker.stop();
   });
 

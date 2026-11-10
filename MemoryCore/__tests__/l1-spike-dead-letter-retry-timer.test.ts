@@ -1,15 +1,16 @@
 /**
- * Spike, mechanism 2: when an L1 task is dead-lettered the worker arms an
+ * Re-run after dead letter: when an L1 task is dead-lettered the worker arms an
  * "L1_dlq" timer; both timer scanners map that member to an L1 task with
  * triggeredBy "dead_letter_retry", which the gateway's executeL1 runs without
  * claimTimerL1Count, so the slice is re-extracted with no new message.
  *
- * Opt-in: PipelineWorker({ deadLetterRetryDelayMs }). With it unset, fact (d)
- * in l1-failure-path-current-behavior.test.ts still holds.
+ * The delay is PipelineWorker's deadLetterRetryDelayMs (gateway config
+ * worker.deadLetterRetryDelayMs, default 15 min). A successful re-run consumes
+ * the live conversation_count, so the next L1_idle is not an empty run.
  *
  * The runner here throws on its first four calls and then delegates to the
- * real createL1Runner. That isolates this mechanism from mechanism 3 (making
- * the real runner throw on a provider error).
+ * real createL1Runner. That isolates this mechanism from the typed errors
+ * (making the real runner throw on a provider error).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -89,6 +90,14 @@ describe("dead letter -> L1_dlq timer -> dead_letter_retry task -> executeL1 run
     expect(seenTasks.at(-1)?.data?.triggeredBy).toBe("dead_letter_retry");
     expect((await new CheckpointManager(dir, silent).read()).runner_states[SESSION].last_l1_cursor).toBe(12);
     expect(armedTimers(backend).has(dlqMember)).toBe(false);
+
+    // The re-run consumed the live count, so the next L1_idle is deduped
+    // instead of running an empty L1.
+    expect((await backend.getSessionState("svc", SESSION, undefined, AGENT))?.conversation_count ?? 0).toBe(0);
+    await backend.setTimer("svc", buildPipelineTimerMember(SESSION, "L1_idle", { agentId: AGENT }), Date.now() + 1_000);
+    expect(await advanceUntil(() => worker.getMetrics().tasksCompleted === 2, 30_000)).toBe(true);
+    expect(seenTasks.at(-1)?.data?.triggeredBy).toBe("timer_scanner");
+    expect(calls).toBe(5);
     await worker.stop();
   });
 

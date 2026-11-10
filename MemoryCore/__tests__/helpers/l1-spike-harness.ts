@@ -116,7 +116,8 @@ export async function gatewayHarness(opts: {
   LocalStateBackendCtor: new (o?: { onTimerExpired?: (e: never) => void }) => LocalStateBackend;
   instanceId: string;
   baseDir: string;
-  runL1: (sessionKey: string) => Promise<{ storedCount: number; hasMore: boolean; hasFullBacklog: boolean; profileScopes: string[] }>;
+  /** `slice` is what executeL1 hands runL1WithStore for a frozen slice (bound or skip). */
+  runL1: (sessionKey: string, slice?: { sliceUpperBoundMs?: number; skipThroughMs?: number }) => Promise<{ storedCount: number; hasMore: boolean; hasFullBacklog: boolean; profileScopes: string[] }>;
 }) {
   const gw = Object.create(opts.TdaiGateway.prototype) as Record<string, unknown>;
   Object.assign(gw, {
@@ -124,7 +125,8 @@ export async function gatewayHarness(opts: {
     logger: silent,
     core: {
       setInstanceId: () => {},
-      runL1WithStore: async (sessionKey: string) => ({ ...(await opts.runL1(sessionKey)), creditUsed: 0 }),
+      runL1WithStore: async (sessionKey: string, _store: unknown, _embedding: unknown, _storage: unknown, _lock: unknown, slice?: { sliceUpperBoundMs?: number; skipThroughMs?: number }) =>
+        ({ ...(await opts.runL1(sessionKey, slice)), creditUsed: 0 }),
     },
     configProvider: {},
     storePool: { mode: "sqlite", getStore: async () => ({ store: {}, embedding: undefined }) },
