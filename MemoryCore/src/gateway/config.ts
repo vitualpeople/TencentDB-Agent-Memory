@@ -62,6 +62,12 @@ export interface WorkerConfig {
   pollMs: number;
   /** 并发消费协程数 (default: 60) */
   concurrency: number;
+  /**
+   * Delay before a dead-lettered L1 slice is re-run with no new message
+   * (default: 900000 = 15 min, 0 disables). See
+   * DEFAULT_DEAD_LETTER_RETRY_DELAY_MS in services/pipeline-worker.ts.
+   */
+  deadLetterRetryDelayMs: number;
 }
 
 export interface CosExtraConfig {
@@ -591,6 +597,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
   const worker: WorkerConfig = {
     pollMs: envInt("WORKER_POLL_MS") ?? num(workerConfig, "pollMs") ?? 200,
     concurrency: envInt("WORKER_CONCURRENCY") ?? num(workerConfig, "concurrency") ?? 60,
+    deadLetterRetryDelayMs: envInt("WORKER_DEAD_LETTER_RETRY_DELAY_MS") ?? num(workerConfig, "deadLetterRetryDelayMs") ?? 900_000,
   };
 
   // COS extra config

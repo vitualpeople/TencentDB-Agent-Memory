@@ -1067,6 +1067,8 @@ export class TdaiCore {
      * standalone 单进程不需要传（进程内 withFileLock 已足够）。
      */
     checkpointLock?: import("../utils/checkpoint.js").CheckpointLockOptions,
+    /** Frozen-slice bound / skip from PipelineWorker (see L1RunnerParams). */
+    slice?: { sliceUpperBoundMs?: number; skipThroughMs?: number },
   ): Promise<{ storedCount: number; creditUsed: number; hasMore: boolean; hasFullBacklog: boolean; profileScopes: string[] }> {
     const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
@@ -1103,7 +1105,7 @@ export class TdaiCore {
       storage: storage ?? this.getStorage(),
       checkpointLock,
     });
-    const result = await runner({ sessionKey, msg: [], bg_msg: [] });
+    const result = await runner({ sessionKey, ...slice });
 
     // Read accumulated credit from the tracking runner (原始浮点数，与监控侧严格一致)
     const creditUsed: number = (llmRunner as any)?.accumulatedCredit ?? 0;

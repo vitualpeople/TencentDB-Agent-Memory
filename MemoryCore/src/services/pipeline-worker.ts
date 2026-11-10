@@ -17,7 +17,8 @@
 import type { IStateBackend, TaskPayload } from "../core/state/types.js";
 import { serializeTraceContext } from "../core/report/trace-propagation.js";
 import { obsLogger } from "../core/report/obs-logger.js";
-import { buildPipelineTimerMember } from "../core/state/timer-member.js";
+import { buildPipelineTimerMember, L1_DEAD_LETTER_TIMER } from "../core/state/timer-member.js";
+import { isL1ExtractionError, type L1ExtractionError } from "../core/record/l1-extraction-error.js";
 
 // ============================
 // Types
@@ -105,6 +106,49 @@ export interface PipelineWorkerConfig {
    * pipeline 一个 consumer。未注入时行为不变。processTask 入口 acquire、finally release。
    */
   permitPool?: import("./worker-permit-pool.js").WorkerPermitPool;
+
+  /**
+   * Dead-lettering an L1 task arms an L1_dlq timer this many ms later; the
+   * timer scanner turns it into a "dead_letter_retry" L1 task that re-runs
+   * the slice with no new message. Default DEFAULT_DEAD_LETTER_RETRY_DELAY_MS
+   * (15 min); 0 disables it (the slice then waits for a new message).
+   */
+  deadLetterRetryDelayMs?: number;
+}
+
+/**
+ * Default delay before a dead-lettered L1 slice is re-run. The worker's own
+ * retries cover 5 + 15 + 45 = 65 s, far shorter than a real provider outage
+ * (an expired key lasted hours). 15 min keeps a dead provider to about 4
+ * calls per 16 min per session (~15/h) yet recovers within 15 min of it
+ * coming back.
+ */
+export const DEFAULT_DEAD_LETTER_RETRY_DELAY_MS = 15 * 60_000;
+
+/**
+ * Consecutive dead-letters of one frozen L1 slice, all caused by parse
+ * failures, after which the slice is skipped: 3 rounds x (1 + 3 retries) =
+ * at most 12 LLM calls for a slice whose replies never parse. Provider
+ * failures never count, so a long outage does not turn into data loss.
+ */
+export const L1_PARSE_DEAD_LETTER_LIMIT = 3;
+
+/**
+ * Slice handed to executeL1 through `task._l1FrozenSlice` while an L1 slice
+ * of the session is failing: retry it bounded to `upperBoundMs`, or, when
+ * `skip`, drop its rows and move the cursor past them.
+ */
+export interface L1FrozenSliceHint {
+  upperBoundMs: number;
+  skip: boolean;
+}
+
+/** Worker-side (in-memory, lost on restart) state of a failing L1 slice. */
+interface FrozenL1Slice extends L1FrozenSliceHint {
+  /** L0 ids that failed when the slice was frozen (logged on skip, never content). */
+  messageIds: string[];
+  /** Consecutive dead-letters whose last failure was kind "parse". */
+  parseDeadLetters: number;
 }
 
 export interface DeadLetterEntry {
@@ -112,6 +156,8 @@ export interface DeadLetterEntry {
   error: string;
   retryCount: number;
   deadAt: number;
+  /** L1ExtractionError.kind when the last failure was a typed L1 error. */
+  errorKind?: string;
 }
 
 const TAG = "[pipeline-worker]";
@@ -154,6 +200,24 @@ export async function claimTimerL1Count(
   return false;
 }
 
+/**
+ * Count claim for a `data.triggeredBy === "dead_letter_retry"` L1 task. It
+ * always runs (a threshold-fired original already zeroed the count, so the
+ * timer dedup would drop it), but it consumes the live count like a
+ * timer-fired L1, so a successful re-run leaves no stale count behind and the
+ * next L1_idle is not an empty run.
+ */
+export async function claimDeadLetterRetryL1Count(
+  backend: IStateBackend,
+  task: TaskPayload,
+  instanceId: string,
+  teamId?: string,
+  agentId?: string,
+): Promise<void> {
+  const state = await backend.getSessionState(instanceId, task.sessionId, teamId, agentId);
+  (task as any)._l1ConsumedCount = state?.conversation_count ?? 0;
+}
+
 // ============================
 // PipelineWorker
 // ============================
@@ -184,6 +248,9 @@ export class PipelineWorker {
   // Dead letter queue (进程内 + 可选回调持久化)
   private deadLetterQueue: DeadLetterEntry[] = [];
 
+  // Failing L1 slices by session (see FrozenL1Slice). RAM only.
+  private frozenL1Slices = new Map<string, FrozenL1Slice>();
+
   // Metrics
   private metrics = {
     tasksConsumed: 0,
@@ -198,6 +265,10 @@ export class PipelineWorker {
     lockLostDuringExecution: 0,
     /** H-11 Step 2: number of times an executor was aborted via AbortSignal due to lockLost. */
     executionAborted: 0,
+    /** L1 task runs that failed with an L1ExtractionError (LLM call failed or reply unparsable). */
+    l1ExtractionFailed: 0,
+    /** L1 slices given up on after L1_PARSE_DEAD_LETTER_LIMIT parse dead-letters. */
+    l1SliceSkipped: 0,
   };
 
   constructor(backend: IStateBackend, executor: TaskExecutor, config?: PipelineWorkerConfig, logger?: Logger) {
@@ -219,6 +290,7 @@ export class PipelineWorker {
       onL2Complete: config?.onL2Complete,
       lockGranularity: config?.lockGranularity ?? "session",
       permitPool: config?.permitPool,
+      deadLetterRetryDelayMs: config?.deadLetterRetryDelayMs ?? DEFAULT_DEAD_LETTER_RETRY_DELAY_MS,
     };
   }
 
@@ -262,7 +334,12 @@ export class PipelineWorker {
   }
 
   getMetrics() {
-    return { ...this.metrics, workerId: this.config.workerId, deadLetterCount: this.deadLetterQueue.length };
+    return {
+      ...this.metrics,
+      workerId: this.config.workerId,
+      deadLetterCount: this.deadLetterQueue.length,
+      l1FrozenSlices: this.frozenL1Slices.size,
+    };
   }
 
   /**
@@ -511,6 +588,7 @@ export class PipelineWorker {
     }, this.config.lockRenewIntervalMs);
 
     // Step 3: 执行任务
+    const frozenSlice = this.applyFrozenL1Slice(task);
     try {
       await this.executeTask(task, abortController.signal);
 
@@ -538,6 +616,7 @@ export class PipelineWorker {
 
       this.metrics.tasksCompleted++;
       this.logger?.debug?.(`${TAG} Task completed: ${task.type} [${task.instanceId}/${task.sessionId}]`);
+      this.settleFrozenL1SliceOnSuccess(task, frozenSlice);
 
       // Step 5: 级联调度 (L1→L2, L2→L3)
       await this.cascadeSchedule(task);
@@ -552,6 +631,17 @@ export class PipelineWorker {
       }
 
       this.metrics.tasksFailed++;
+
+      // A typed L1 failure may still carry groups of the slice that finished:
+      // schedule their L2 now, the retry will skip them.
+      const typedL1Error = isL1ExtractionError(err) ? err : undefined;
+      if (typedL1Error) {
+        this.metrics.l1ExtractionFailed++;
+        this.recordFrozenL1SliceFailure(task, frozenSlice, typedL1Error);
+        if (typedL1Error.completedProfileScopes.length > 0) {
+          await this.advanceL2AfterL1(task, typedL1Error.completedProfileScopes);
+        }
+      }
 
       // 指数退避重试
       if (retryCount < this.config.maxRetries) {
@@ -570,7 +660,8 @@ export class PipelineWorker {
         await this.reEnqueue(task, retryCount + 1);
         this.metrics.tasksRetried++;
       } else {
-        await this.moveToDeadLetter(task, errMsg, retryCount);
+        if (typedL1Error) this.countFrozenL1SliceDeadLetter(task, typedL1Error);
+        await this.moveToDeadLetter(task, errMsg, retryCount, typedL1Error?.kind);
       }
     } finally {
       // Step 6: 停止续约 + 释放锁
@@ -650,17 +741,7 @@ export class PipelineWorker {
         ? ((task as any)._l2ProfileScopes as string[]).filter(Boolean)
         : [];
       const l2Keys = profileScopes.length > 0 ? profileScopes : [task.sessionId];
-      if (this.config.onL1Complete) {
-        for (const l2Key of l2Keys) {
-          try {
-            await this.backend.updateSessionState(task.instanceId, l2Key, { l2_pending_l1_count: 1 }, tid, aid);
-            await this.config.onL1Complete(l2Key, task.instanceId, tid, aid);
-          } catch (err) {
-            this.logger?.warn?.(`${TAG} onL1Complete failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-      }
-      this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L1 done → L2 timer advanced (${l2Keys.join(",")})`);
+      await this.advanceL2AfterL1(task, l2Keys);
     }
 
     if (task.type === "L2") {
@@ -697,6 +778,107 @@ export class PipelineWorker {
       }
       this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L2 done → L3 enqueued`);
     }
+  }
+
+  // ============================
+  // Frozen L1 slice (retry bound + give-up cap for unparsable replies)
+  // ============================
+  //
+  // At the first typed failure of an L1 run the slice is frozen: its upper
+  // recorded_at_ms bound is kept, and every later L1 run of the session
+  // (retry, dead_letter_retry, or one triggered by a new message) processes
+  // only rows up to that bound. A slice is identified by that bound, not by
+  // the cursor, so good messages arriving between retries are never folded
+  // into it. After L1_PARSE_DEAD_LETTER_LIMIT consecutive parse dead-letters
+  // the next run skips it. The state lives in RAM: a restart forgets it, and
+  // the slice then starts a fresh count.
+
+  private frozenL1SliceKey(task: TaskPayload): string {
+    const tid = task.teamId ?? (task.data as any)?.teamId ?? "";
+    const aid = task.agentId ?? (task.data as any)?.agentId ?? "";
+    return `${task.instanceId}\u0000${tid}\u0000${aid}\u0000${task.sessionId}`;
+  }
+
+  /** Hand the session's frozen slice (if any) to executeL1; returns the state used. */
+  private applyFrozenL1Slice(task: TaskPayload): FrozenL1Slice | undefined {
+    if (task.type !== "L1") return undefined;
+    const slice = this.frozenL1Slices.get(this.frozenL1SliceKey(task));
+    if (!slice) {
+      delete (task as any)._l1FrozenSlice;
+      return undefined;
+    }
+    const hint: L1FrozenSliceHint = { upperBoundMs: slice.upperBoundMs, skip: slice.skip };
+    (task as any)._l1FrozenSlice = hint;
+    return slice;
+  }
+
+  private releaseFrozenL1Slice(task: TaskPayload, slice: FrozenL1Slice): void {
+    const key = this.frozenL1SliceKey(task);
+    if (this.frozenL1Slices.get(key) === slice) this.frozenL1Slices.delete(key);
+    if (slice.skip) {
+      this.metrics.l1SliceSkipped++;
+      this.logger.warn(
+        `${TAG} [${task.instanceId}/${task.sessionId}] L1 slice skipped after ${slice.parseDeadLetters} parse ` +
+        `dead-letter(s); cursor moved past recorded_at_ms=${slice.upperBoundMs}; skipped ids=${slice.messageIds.join(",")}`,
+      );
+    } else {
+      this.logger.info(`${TAG} [${task.instanceId}/${task.sessionId}] Frozen L1 slice (<= ${slice.upperBoundMs}) extracted`);
+    }
+  }
+
+  private settleFrozenL1SliceOnSuccess(task: TaskPayload, slice: FrozenL1Slice | undefined): void {
+    if (!slice) return;
+    // The executor returned without running the L1 runner (timer dedup, quota).
+    if ((task as any)._l1Skipped || (task as any)._l1NotRun) return;
+    this.releaseFrozenL1Slice(task, slice);
+  }
+
+  private recordFrozenL1SliceFailure(task: TaskPayload, slice: FrozenL1Slice | undefined, err: L1ExtractionError): void {
+    if (task.type !== "L1") return;
+    if (slice?.skip) {
+      // The runner moved the cursor past the skipped slice before a later
+      // group failed, so the skip took effect; what failed is a new slice.
+      this.releaseFrozenL1Slice(task, slice);
+      slice = undefined;
+    }
+    if (slice || err.upperBoundMs === undefined) return; // stays frozen at its first failure
+    this.frozenL1Slices.set(this.frozenL1SliceKey(task), {
+      upperBoundMs: err.upperBoundMs,
+      skip: false,
+      messageIds: [...err.frozenMessageIds],
+      parseDeadLetters: 0,
+    });
+  }
+
+  private countFrozenL1SliceDeadLetter(task: TaskPayload, err: L1ExtractionError): void {
+    if (task.type !== "L1") return;
+    const slice = this.frozenL1Slices.get(this.frozenL1SliceKey(task));
+    if (!slice) return;
+    slice.parseDeadLetters = err.kind === "parse" ? slice.parseDeadLetters + 1 : 0;
+    if (!slice.skip && slice.parseDeadLetters >= L1_PARSE_DEAD_LETTER_LIMIT) {
+      slice.skip = true;
+      this.logger.warn(
+        `${TAG} [${task.instanceId}/${task.sessionId}] L1 slice (<= ${slice.upperBoundMs}) failed to parse in ` +
+        `${slice.parseDeadLetters} consecutive dead-letter rounds; the next L1 run skips it`,
+      );
+    }
+  }
+
+  /** Mark each L2 key pending and advance its L2 timer (onL1Complete). */
+  private async advanceL2AfterL1(task: TaskPayload, l2Keys: string[]): Promise<void> {
+    const tid = task.teamId ?? (task.data as any)?.teamId;
+    const aid = task.agentId ?? (task.data as any)?.agentId;
+    if (this.config.onL1Complete) {
+      for (const l2Key of l2Keys) {
+        try {
+          await this.backend.updateSessionState(task.instanceId, l2Key, { l2_pending_l1_count: 1 }, tid, aid);
+          await this.config.onL1Complete(l2Key, task.instanceId, tid, aid);
+        } catch (err) {
+          this.logger?.warn?.(`${TAG} onL1Complete failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    this.logger?.debug?.(`${TAG} [${task.instanceId}/${task.sessionId}] L1 done → L2 timer advanced (${l2Keys.join(",")})`);
   }
 
   // ============================
@@ -788,8 +970,8 @@ export class PipelineWorker {
   // Dead Letter (#13)
   // ============================
 
-  private async moveToDeadLetter(task: TaskPayload, error: string, retryCount: number): Promise<void> {
-    const entry: DeadLetterEntry = { task, error, retryCount, deadAt: Date.now() };
+  private async moveToDeadLetter(task: TaskPayload, error: string, retryCount: number, errorKind?: string): Promise<void> {
+    const entry: DeadLetterEntry = { task, error, retryCount, deadAt: Date.now(), ...(errorKind ? { errorKind } : {}) };
     this.deadLetterQueue.push(entry);
     this.metrics.tasksDeadLettered++;
 
@@ -813,6 +995,18 @@ export class PipelineWorker {
       await this.backend.removeTimer(task.instanceId, buildPipelineTimerMember(task.sessionId, "L1_idle", { teamId: tid, agentId: aid }));
       await this.backend.removeTimer(task.instanceId, buildPipelineTimerMember(task.sessionId, "L2_schedule", { teamId: tid, agentId: aid }));
     } catch { /* best effort */ }
+
+    // Arm a delayed re-run of this L1 slice (see deadLetterRetryDelayMs).
+    if (task.type === "L1" && this.config.deadLetterRetryDelayMs > 0) {
+      const tid = task.teamId ?? (task.data as any)?.teamId;
+      const aid = task.agentId ?? (task.data as any)?.agentId;
+      const member = buildPipelineTimerMember(task.sessionId, L1_DEAD_LETTER_TIMER, { teamId: tid, agentId: aid });
+      try {
+        await this.backend.setTimer(task.instanceId, member, entry.deadAt + this.config.deadLetterRetryDelayMs);
+      } catch (err) {
+        this.logger.warn(`${TAG} Failed to arm ${L1_DEAD_LETTER_TIMER} for ${task.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     // 关键节点日志：任务进入死信队列
     obsLogger.error("core.task.dead_letter", {

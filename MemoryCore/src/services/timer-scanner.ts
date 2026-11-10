@@ -18,7 +18,7 @@
  */
 
 import type { IStateBackend, TaskPayload, TimerEntry } from "../core/state/types.js";
-import { parsePipelineTimerMember } from "../core/state/timer-member.js";
+import { parsePipelineTimerMember, timerTriggeredBy } from "../core/state/timer-member.js";
 
 interface Logger {
   debug?: (message: string) => void;
@@ -164,7 +164,7 @@ export class TimerScanner {
             agentId,
             priority,
             createdAt: now,
-            data: { triggeredBy: "timer_scanner", timerMember: `${sessionId}:${timerType}`, instanceId, teamId, agentId },
+            data: { triggeredBy: timerTriggeredBy(timerType), timerMember: `${sessionId}:${timerType}`, instanceId, teamId, agentId },
           };
 
           await this.backend.enqueueTask(task);
