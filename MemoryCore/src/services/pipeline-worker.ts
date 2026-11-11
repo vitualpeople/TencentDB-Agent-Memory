@@ -108,10 +108,12 @@ export interface PipelineWorkerConfig {
   permitPool?: import("./worker-permit-pool.js").WorkerPermitPool;
 
   /**
-   * Dead-lettering an L1 task arms an L1_dlq timer this many ms later; the
-   * timer scanner turns it into a "dead_letter_retry" L1 task that re-runs
-   * the slice with no new message. Default DEFAULT_DEAD_LETTER_RETRY_DELAY_MS
-   * (15 min); 0 disables it (the slice then waits for a new message).
+   * Dead-lettering an L1 task whose last failure is a typed L1ExtractionError
+   * arms an L1_dlq timer this many ms later; the timer scanner turns it into
+   * a "dead_letter_retry" L1 task that re-runs the slice with no new message.
+   * Default DEFAULT_DEAD_LETTER_RETRY_DELAY_MS (15 min); 0 disables it (the
+   * slice then waits for a new message). An untyped dead-letter never arms
+   * it (see moveToDeadLetter).
    */
   deadLetterRetryDelayMs?: number;
 }
@@ -250,6 +252,11 @@ export class PipelineWorker {
 
   // Failing L1 slices by session (see FrozenL1Slice). RAM only.
   private frozenL1Slices = new Map<string, FrozenL1Slice>();
+
+  // Sessions (frozenL1SliceKey) with an L1_dlq timer this worker armed that
+  // has not fired yet as far as it knows. RAM only; lets an untyped
+  // dead-letter remove that timer without probing the backend.
+  private pendingL1DeadLetterRetries = new Set<string>();
 
   // Metrics
   private metrics = {
@@ -588,6 +595,10 @@ export class PipelineWorker {
     }, this.config.lockRenewIntervalMs);
 
     // Step 3: 执行任务
+    // A dead_letter_retry task means its L1_dlq timer has fired.
+    if (task.type === "L1" && task.data?.triggeredBy === "dead_letter_retry") {
+      this.pendingL1DeadLetterRetries.delete(this.frozenL1SliceKey(task));
+    }
     const frozenSlice = this.applyFrozenL1Slice(task);
     try {
       await this.executeTask(task, abortController.signal);
@@ -996,17 +1007,7 @@ export class PipelineWorker {
       await this.backend.removeTimer(task.instanceId, buildPipelineTimerMember(task.sessionId, "L2_schedule", { teamId: tid, agentId: aid }));
     } catch { /* best effort */ }
 
-    // Arm a delayed re-run of this L1 slice (see deadLetterRetryDelayMs).
-    if (task.type === "L1" && this.config.deadLetterRetryDelayMs > 0) {
-      const tid = task.teamId ?? (task.data as any)?.teamId;
-      const aid = task.agentId ?? (task.data as any)?.agentId;
-      const member = buildPipelineTimerMember(task.sessionId, L1_DEAD_LETTER_TIMER, { teamId: tid, agentId: aid });
-      try {
-        await this.backend.setTimer(task.instanceId, member, entry.deadAt + this.config.deadLetterRetryDelayMs);
-      } catch (err) {
-        this.logger.warn(`${TAG} Failed to arm ${L1_DEAD_LETTER_TIMER} for ${task.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    if (task.type === "L1") await this.settleL1DeadLetterRetry(task, entry.deadAt, errorKind);
 
     // 关键节点日志：任务进入死信队列
     obsLogger.error("core.task.dead_letter", {
@@ -1025,6 +1026,48 @@ export class PipelineWorker {
       } catch (err) {
         this.logger.error(`${TAG} onDeadLetter callback failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+  }
+
+  /**
+   * Delayed re-run of a dead-lettered L1 slice (see deadLetterRetryDelayMs).
+   *
+   * Only a typed L1ExtractionError arms L1_dlq: every LLM provider failure on
+   * the L1 path reaches the worker typed (the extractor wraps the extraction
+   * call; dedup and embedding failures are swallowed). An untyped error is a
+   * local one (checkpoint write, store, config) and can come after a paid LLM
+   * call that succeeded, so re-running it on a timer would pay for the same
+   * extraction every cycle with no end. It keeps the pre-timer behaviour
+   * instead: the slice re-runs when the session gets a new message. It also
+   * removes an L1_dlq still pending from an earlier typed round, so no timer
+   * re-runs the slice after this last round.
+   */
+  private async settleL1DeadLetterRetry(task: TaskPayload, deadAt: number, errorKind?: string): Promise<void> {
+    const tid = task.teamId ?? (task.data as any)?.teamId;
+    const aid = task.agentId ?? (task.data as any)?.agentId;
+    const member = buildPipelineTimerMember(task.sessionId, L1_DEAD_LETTER_TIMER, { teamId: tid, agentId: aid });
+    const scope = this.frozenL1SliceKey(task);
+
+    if (errorKind) {
+      if (this.config.deadLetterRetryDelayMs <= 0) return;
+      try {
+        await this.backend.setTimer(task.instanceId, member, deadAt + this.config.deadLetterRetryDelayMs);
+        this.pendingL1DeadLetterRetries.add(scope);
+      } catch (err) {
+        this.logger.warn(`${TAG} Failed to arm ${L1_DEAD_LETTER_TIMER} for ${task.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    this.logger.warn(
+      `${TAG} [${task.instanceId}/${task.sessionId}] L1 dead-letter without a typed L1 error: ` +
+      `no ${L1_DEAD_LETTER_TIMER} re-run; the slice re-runs on the next message`,
+    );
+    if (!this.pendingL1DeadLetterRetries.delete(scope)) return;
+    try {
+      await this.backend.removeTimer(task.instanceId, member);
+    } catch (err) {
+      this.logger.warn(`${TAG} Failed to remove ${L1_DEAD_LETTER_TIMER} for ${task.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

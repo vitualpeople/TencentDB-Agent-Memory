@@ -9,8 +9,9 @@
  *   (c) an LLM error or an unparsable reply is an L1ExtractionError (kind
  *       "provider" / "parse"); the runner throws it and does not move the
  *       cursor past the failed rows. A valid empty array is still a success.
- *   (d) moveToDeadLetter removes the session's L1_idle timer and arms an
- *       L1_dlq timer (default 15 min) that re-runs the slice.
+ *   (d) moveToDeadLetter removes the session's L1_idle timer and, when the
+ *       last failure is a typed L1ExtractionError, arms an L1_dlq timer
+ *       (default 15 min) that re-runs the slice.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -191,7 +192,7 @@ describe("(d) dead letter clears L1_idle and arms a delayed L1_dlq re-run", () =
     const backend = new LocalStateBackend({ onTimerExpired: (e) => { fired.push(e.member); } });
     let runs = 0;
     const worker = new PipelineWorker(backend, {
-      async executeL1() { runs++; throw providerError(503); },
+      async executeL1() { runs++; throw new L1ExtractionError("provider", "LLM API call failed: HTTP 503"); },
       async executeL2() {}, async executeL3() {},
     }, { concurrency: 1, pollIntervalMs: 200, lockRenewIntervalMs: 60_000 }, silent);
     const idle = buildPipelineTimerMember(SESSION, "L1_idle", { agentId: "default" });
