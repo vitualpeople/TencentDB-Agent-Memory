@@ -62,13 +62,29 @@ export class MemoryBackend implements IStorageBackend {
   text(key: string): string | undefined { return this.objects.get(key)?.content.toString("utf-8"); }
 }
 
+/**
+ * Persona of a fixture: a string is the persona body, `{ persona: null }` is a
+ * real cold start (no persona.md at all), omitted is the default PERSONA.
+ */
+export type PersonaFixtureArg = string | { persona: string | null };
+
+function personaOf(arg: PersonaFixtureArg | undefined): string | null {
+  if (arg === undefined) return PERSONA;
+  return typeof arg === "string" ? arg : arg.persona;
+}
+
 /** Local data dir with one scene, an optional persona, and a checkpoint that triggers L3 (first scene block). */
-export async function fsFixture(persona: string | undefined = PERSONA): Promise<string> {
-  const dir = tmpDir("l3-persona-");
+export async function fsFixture(arg?: PersonaFixtureArg): Promise<string> {
+  return fsFixtureAt(tmpDir("l3-persona-"), arg);
+}
+
+/** The same fixture written into an existing (or new) directory, e.g. a profile scope dir. */
+export async function fsFixtureAt(dir: string, arg?: PersonaFixtureArg): Promise<string> {
+  const persona = personaOf(arg);
   fs.mkdirSync(path.join(dir, "scene_blocks"), { recursive: true });
   fs.writeFileSync(path.join(dir, "scene_blocks", SCENE_FILE), SCENE_BODY, "utf-8");
   await writeSceneIndex(dir, [SCENE_ENTRY]);
-  if (persona !== undefined) fs.writeFileSync(path.join(dir, "persona.md"), persona, "utf-8");
+  if (persona !== null) fs.writeFileSync(path.join(dir, "persona.md"), persona, "utf-8");
   const cp = new CheckpointManager(dir, silent);
   await cp.incrementScenesProcessed();
   await cp.incrementMemoriesSincePersona(4);
@@ -76,17 +92,35 @@ export async function fsFixture(persona: string | undefined = PERSONA): Promise<
 }
 
 /** Same fixture in an in-memory StorageAdapter (service mode). */
-export async function storageFixture(persona: string | undefined = PERSONA): Promise<{ dir: string; storage: StorageAdapter; backend: MemoryBackend }> {
+export async function storageFixture(arg?: PersonaFixtureArg): Promise<{ dir: string; storage: StorageAdapter; backend: MemoryBackend }> {
+  const persona = personaOf(arg);
   const dir = tmpDir("l3-persona-storage-");
   const backend = new MemoryBackend();
   const storage = new StorageAdapter(backend);
   await storage.writeFile(`scene_blocks/${SCENE_FILE}`, SCENE_BODY);
   await writeSceneIndex(dir, [SCENE_ENTRY], storage);
-  if (persona !== undefined) await storage.writeFile("persona.md", persona);
+  if (persona !== null) await storage.writeFile("persona.md", persona);
   const cp = new CheckpointManager(dir, silent, storage);
   await cp.incrementScenesProcessed();
   await cp.incrementMemoriesSincePersona(4);
   return { dir, storage, backend };
+}
+
+/**
+ * A copy of a fixture's backend whose first scene-index read runs `onFirstRead`
+ * (e.g. advance a fake clock, abort a signal): a slow first step of the scope,
+ * after the scope started and before the generator.
+ */
+export function slowSceneIndexStorage(backend: MemoryBackend, onFirstRead: () => void): StorageAdapter {
+  const slow = new MemoryBackend();
+  for (const [k, v] of backend.objects) slow.objects.set(k, v);
+  const getObject = slow.getObject.bind(slow);
+  let spent = false;
+  slow.getObject = async (key: string) => {
+    if (!spent && key === ".metadata/scene_index.json") { spent = true; onFirstRead(); }
+    return getObject(key);
+  };
+  return new StorageAdapter(slow);
 }
 
 export interface LogLine { level: "debug" | "info" | "warn" | "error"; msg: string }
@@ -122,6 +156,13 @@ export function scriptedRunner(script: Array<(p: LLMRunParams) => Promise<string
   return { runner: runner as unknown as LLMRunner, calls };
 }
 
+/** Call the persona `write` tool createL3Runner handed to runner.run (goes through the allowlist wrapper). */
+export async function writeViaTool(p: LLMRunParams, content: string, rawPath = "persona.md"): Promise<string> {
+  const write = (p.tools as Record<string, { execute: (a: unknown, o?: unknown) => Promise<unknown> }> | undefined)?.write;
+  if (!write) throw new Error("runner.run got no persona write tool");
+  return String(await write.execute({ path: rawPath, content }, {}));
+}
+
 /** Write persona.md the way a tool call would, with an mtime that surely moved. */
 export function writePersonaFs(dir: string, content: string): void {
   const file = path.join(dir, "persona.md");
@@ -138,6 +179,7 @@ export function l3For(opts: {
   logger?: typeof silent;
   personaTelemetry?: unknown;
   checkpointLock?: unknown;
+  vectorStore?: unknown;
 }) {
   return createL3Runner({
     pluginDataDir: opts.dir,
@@ -148,6 +190,7 @@ export function l3For(opts: {
     storage: opts.storage,
     ...(opts.personaTelemetry ? { personaTelemetry: opts.personaTelemetry } : {}),
     ...(opts.checkpointLock ? { checkpointLock: opts.checkpointLock } : {}),
+    ...(opts.vectorStore ? { vectorStore: opts.vectorStore } : {}),
   } as Parameters<typeof createL3Runner>[0]);
 }
 
@@ -157,7 +200,14 @@ export async function checkpointOf(dir: string, storage?: StorageAdapter) {
 
 /** A sink that only records what it is given (duck-typed, no import of the real sink). */
 export function recordingSink() {
-  const records: Array<{ invokedRunner: boolean; nudged: boolean; nudgeSucceeded: boolean; overLimit: boolean }> = [];
+  const records: Array<{
+    invokedRunner: boolean;
+    nudged: boolean;
+    nudgeSucceeded: boolean;
+    overLimit: boolean;
+    countedScopeEnd: boolean;
+    nudgeSkipped: boolean;
+  }> = [];
   return { records, record: (r: (typeof records)[number]) => { records.push(r); } };
 }
 

@@ -38,6 +38,8 @@ describe("PersonaGenerationSink injected into createL3Runner", () => {
       personaWriteNudges: 1,
       personaWriteNudgeSuccesses: 1,
       personaOverLimit: 1,
+      personaScopeEnds: 2,
+      personaWriteNudgesSkipped: 0,
     });
   });
 
@@ -48,6 +50,42 @@ describe("PersonaGenerationSink injected into createL3Runner", () => {
 
     await l3For({ dir, runner: scriptedRunner([noWrite, noWrite]).runner, personaTelemetry: sink }).call(undefined).catch(() => undefined);
 
-    expect(sink.snapshot()).toEqual({ personaGenerations: 1, personaWriteNudges: 1, personaWriteNudgeSuccesses: 0, personaOverLimit: 0 });
+    expect(sink.snapshot()).toEqual({
+      personaGenerations: 1,
+      personaWriteNudges: 1,
+      personaWriteNudgeSuccesses: 0,
+      personaOverLimit: 0,
+      personaScopeEnds: 1,
+      personaWriteNudgesSkipped: 0,
+    });
+  });
+
+  it("scope ends count a failure that never reached the runner; a skipped nudge is counted", async () => {
+    vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
+    vi.stubEnv("TDAI_PERSONA_TIMEOUT_MS", undefined);
+    const sink = new PersonaGenerationSink();
+
+    // Scope end 1: aborted before the generator -> failed, invokedRunner=false.
+    const dirAbort = await fsFixture();
+    const controller = new AbortController();
+    controller.abort();
+    await l3For({ dir: dirAbort, runner: scriptedRunner([noWrite]).runner, personaTelemetry: sink })
+      .call(undefined, { signal: controller.signal }).catch(() => undefined);
+    // Scope end 2: call 1 spends 165 s of 180 s without writing -> nudge skipped.
+    const dirSkip = await fsFixture();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-13T07:00:00.000Z"));
+    const slow = () => { vi.setSystemTime(new Date(Date.now() + 165_000)); return "no write"; };
+    await l3For({ dir: dirSkip, runner: scriptedRunner([slow]).runner, personaTelemetry: sink }).call(undefined).catch(() => undefined);
+    vi.useRealTimers();
+
+    expect(sink.snapshot()).toEqual({
+      personaGenerations: 1,
+      personaWriteNudges: 0,
+      personaWriteNudgeSuccesses: 0,
+      personaOverLimit: 0,
+      personaScopeEnds: 2,
+      personaWriteNudgesSkipped: 1,
+    });
   });
 });

@@ -102,6 +102,30 @@ export interface PersonaConfig {
    * (default 6000; env TDAI_PERSONA_MAX_CHARS_CODE wins over YAML; 200..50000).
    */
   maxCharsCode: number;
+  /**
+   * Least time (ms) left in the generation deadline to start the first runner
+   * call; less fails the generation with reason=deadline and no call
+   * (default min(30000, floor(timeoutMs / 6)); env TDAI_PERSONA_MIN_RUNNER_MS
+   * wins over YAML; integer 0..600000, at most timeoutMs).
+   */
+  minRunnerMs: number;
+  /**
+   * Least time (ms) left to send the write nudge; less skips the nudge and
+   * fails the generation with reason=deadline
+   * (default min(20000, floor(timeoutMs / 9)); env TDAI_PERSONA_MIN_NUDGE_MS
+   * wins over YAML; integer 0..600000, at most timeoutMs).
+   */
+  minNudgeMs: number;
+}
+
+/** Default minRunnerMs for a generation budget: 30000 at the 180000 default. */
+export function defaultPersonaMinRunnerMs(budgetMs: number): number {
+  return Math.min(30_000, Math.floor(budgetMs / 6));
+}
+
+/** Default minNudgeMs for a generation budget: 20000 at the 180000 default. */
+export function defaultPersonaMinNudgeMs(budgetMs: number): number {
+  return Math.min(20_000, Math.floor(budgetMs / 9));
 }
 
 /** Pipeline trigger settings (L1→L2→L3 scheduling). */
@@ -464,6 +488,22 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const personaTimeoutMs = personaIntSetting(personaGroup, "timeoutMs", "TDAI_PERSONA_TIMEOUT_MS", 180_000, 1_000, 600_000);
   const personaMaxCharsChat = personaIntSetting(personaGroup, "maxCharsChat", "TDAI_PERSONA_MAX_CHARS_CHAT", 6_000, 200, 50_000);
   const personaMaxCharsCode = personaIntSetting(personaGroup, "maxCharsCode", "TDAI_PERSONA_MAX_CHARS_CODE", 6_000, 200, 50_000);
+  const personaMinRunnerMs = personaIntSetting(
+    personaGroup, "minRunnerMs", "TDAI_PERSONA_MIN_RUNNER_MS", defaultPersonaMinRunnerMs(personaTimeoutMs), 0, 600_000,
+  );
+  const personaMinNudgeMs = personaIntSetting(
+    personaGroup, "minNudgeMs", "TDAI_PERSONA_MIN_NUDGE_MS", defaultPersonaMinNudgeMs(personaTimeoutMs), 0, 600_000,
+  );
+  if (personaMinRunnerMs > personaTimeoutMs) {
+    throw new Error(
+      `TDAI_PERSONA_MIN_RUNNER_MS (memory.persona.minRunnerMs) must not exceed memory.persona.timeoutMs (${personaTimeoutMs}), got ${personaMinRunnerMs}`,
+    );
+  }
+  if (personaMinNudgeMs > personaTimeoutMs) {
+    throw new Error(
+      `TDAI_PERSONA_MIN_NUDGE_MS (memory.persona.minNudgeMs) must not exceed memory.persona.timeoutMs (${personaTimeoutMs}), got ${personaMinNudgeMs}`,
+    );
+  }
   const jevProvider = str(jevGroup, "provider") ?? "jev";
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(jevProvider)) {
     throw new Error(`memory.persona.jev.provider has invalid name "${jevProvider}"`);
@@ -695,6 +735,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       timeoutMs: personaTimeoutMs,
       maxCharsChat: personaMaxCharsChat,
       maxCharsCode: personaMaxCharsCode,
+      minRunnerMs: personaMinRunnerMs,
+      minNudgeMs: personaMinNudgeMs,
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,

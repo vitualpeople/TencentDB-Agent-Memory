@@ -12,20 +12,28 @@
  *   path "./persona.md" is allowed; "scene_blocks/../persona.md" and
  *        "scene_blocks/persona.md" are refused, on FS and on storage.
  *   a forbidden call followed by a valid persona.md write still fails.
- *   I-F  the tools createL3Runner builds reach runner.run.
+ *   I-F  the tools createL3Runner builds reach runner.run; the violation
+ *        flag is per scope and per generation (two scopes, fail-fast across
+ *        discovered scopes, a clean second generation after a violation).
  *   controls: a valid write and a valid edit of persona.md (FS and storage).
  */
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildProfileIsolationScope } from "../src/core/profile/profile-sync.js";
 import type { LLMRunParams, LLMRunner } from "../src/core/types.js";
 import {
   PERSONA,
   SCENE_BODY,
   capturingLogger,
   checkpointOf,
+  endFields,
+  endLines,
   fsFixture,
+  fsFixtureAt,
   l3For,
+  scriptedRunner,
+  tmpDir,
   realRunner,
   storageFixture,
   stubChatProvider,
@@ -165,6 +173,75 @@ describe("Case I-F the tools reach runner.run through createL3Runner + PersonaGe
 
     expect(seen).toHaveLength(1);
     expect(Object.keys(seen[0].tools ?? {}).sort()).toEqual(["edit", "read", "write"]);
+  });
+});
+
+describe("Case I-F the violation flag is isolated per scope and per generation", () => {
+  /** A plugin data dir holding two profile scopes (agents a and b), each a full fixture. */
+  async function twoScopes() {
+    const root = tmpDir("l3-persona-scopes-");
+    const scopeA = buildProfileIsolationScope({ agentId: "a" });
+    const scopeB = buildProfileIsolationScope({ agentId: "b" });
+    const dirA = await fsFixtureAt(path.join(root, "profiles", encodeURIComponent(scopeA)));
+    const dirB = await fsFixtureAt(path.join(root, "profiles", encodeURIComponent(scopeB)));
+    return { root, scopeA, scopeB, dirA, dirB };
+  }
+
+  it("I-F a two calls on two independent scopes: scope 1 is refused a forbidden path, scope 2 then writes persona.md cleanly", async () => {
+    vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
+    const s = await twoScopes();
+    const { logger, lines } = capturingLogger();
+    stubChatProvider([
+      [{ name: "write", args: { path: "notes.md", content: "x" } }], null,
+      [{ name: "write", args: { path: "persona.md", content: NEW_PERSONA } }], null,
+    ]);
+    const l3 = l3For({ dir: s.root, runner: realRunner(logger), logger });
+
+    const first = await l3({ agentId: "a" }).then(() => "resolved", (e: Error) => e.message);
+    const second = await l3({ agentId: "b" }).then(() => "resolved", (e: Error) => e.message);
+
+    expect(first).toContain("Persona generation failed");
+    expect(second).toBe("resolved");
+    expect(refusals(lines)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(s.dirB, "persona.md"), "utf-8")).toContain("Also writes tests first.");
+    expect((await checkpointOf(s.dirB)).memories_since_last_persona).toBe(0);
+    expect((await checkpointOf(s.dirA)).last_persona_time).toBe("");
+    expect(endLines(lines).map((l) => endFields(l).outcome)).toEqual(["failed", "generated"]);
+  });
+
+  it("I-F b one call without task isolation over 2 discovered scopes: scope 1 fails (throw) -> fail-fast, scope 2 never runs, one end line", async () => {
+    vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
+    const s = await twoScopes();
+    const { logger, lines } = capturingLogger();
+    const { runner, calls } = scriptedRunner([() => { throw Object.assign(new Error("upstream 503"), { statusCode: 503 }); }]);
+
+    await expect(l3For({ dir: s.root, runner, logger }).call(undefined)).rejects.toThrow("Persona generation failed");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].workspaceDir).toBe(s.dirA);
+    const ends = endLines(lines);
+    expect(ends).toHaveLength(1);
+    expect(endFields(ends[0])).toMatchObject({ scope: s.scopeA, outcome: "failed" });
+    expect((await checkpointOf(s.dirB)).last_persona_time).toBe("");
+  });
+
+  it("I-F c a second generation on the same scope after a violation starts with a clean flag and succeeds", async () => {
+    vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
+    const dir = await fsFixture();
+    const { logger, lines } = capturingLogger();
+    stubChatProvider([
+      [{ name: "write", args: { path: ".metadata/scene_index.json", content: "[]" } }], null,
+      [{ name: "write", args: { path: "persona.md", content: NEW_PERSONA } }], null,
+    ]);
+    const l3 = l3For({ dir, runner: realRunner(logger), logger });
+
+    const first = await l3().then(() => "resolved", (e: Error) => e.message);
+    const second = await l3().then(() => "resolved", (e: Error) => e.message);
+
+    expect(first).toContain("Persona generation failed");
+    expect(second).toBe("resolved");
+    expect(refusals(lines)).toHaveLength(1);
+    expect((await checkpointOf(dir)).memories_since_last_persona).toBe(0);
   });
 });
 

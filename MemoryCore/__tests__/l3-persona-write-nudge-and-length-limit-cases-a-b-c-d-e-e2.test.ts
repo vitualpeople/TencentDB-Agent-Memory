@@ -19,6 +19,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPersonaPrompt } from "../src/core/prompts/persona-generation.js";
 import { PersonaGenerator } from "../src/core/persona/persona-generator.js";
 import { writeSceneIndex } from "../src/core/scene/scene-index.js";
+import { stripSceneNavigation } from "../src/core/scene/scene-navigation.js";
+import { escapeXmlTags } from "../src/utils/sanitize.js";
 import {
   PERSONA,
   SCENE_FILE,
@@ -148,11 +150,14 @@ describe("Case D length limit from config, compress mode", () => {
   });
 
   it("D below the limit: no compress instruction (control for the trigger)", () => {
+    const existing = body(5_000);
     const { userPrompt } = buildPersonaPrompt({
       mode: "incremental", promptMode: "chat", currentTime: "t", totalProcessed: 1, sceneCount: 1,
-      changedSceneCount: 1, changedScenesContent: "", existingPersona: body(5_000),
+      changedSceneCount: 1, changedScenesContent: "", existingPersona: existing,
+      // The canonical measure, as the generator computes it.
+      existingPersonaChars: escapeXmlTags(stripSceneNavigation(existing).trim()).length,
       personaFilePath: "", checkpointPath: "", maxCharsChat: 6_000,
-    } as Parameters<typeof buildPersonaPrompt>[0]);
+    });
     expect(userPrompt).not.toContain("整体重写");
   });
 });

@@ -30,6 +30,7 @@ import type {
   Logger,
 } from "../../core/types.js";
 import type { LLMUsage } from "../../core/report/metric-tracking-runner.js";
+import { assertWriteAllowed, type CheckpointWriteGuard } from "../../utils/checkpoint.js";
 
 const TAG = "[memory-tdai] [standalone-runner]";
 
@@ -119,7 +120,13 @@ export function resolveSandboxedPath(workspaceDir: string, relativePath: string)
 // Tool definitions (Vercel AI SDK `tool()` format)
 // ============================
 
-export function createSandboxedTools(workspaceDir: string, logger?: Logger) {
+/**
+ * @param guard - optional write guard (L3 persona): re-checked right before
+ *   each fs write, so a write never starts after the caller's abort or
+ *   deadline, including after edit's read. The refusal comes back to the
+ *   model as a tool error.
+ */
+export function createSandboxedTools(workspaceDir: string, logger?: Logger, guard?: CheckpointWriteGuard) {
   return {
     read: tool({
       description: "Read the contents of a file at the given relative path.",
@@ -159,6 +166,7 @@ export function createSandboxedTools(workspaceDir: string, logger?: Logger) {
         const resolved = resolveSandboxedPath(workspaceDir, args.path);
         if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
         try {
+          assertWriteAllowed(guard);
           await fsPromises.mkdir(path.dirname(resolved), { recursive: true });
           await fsPromises.writeFile(resolved, args.content, "utf-8");
           logger?.debug?.(`${TAG} write: "${args.path}" → ${args.content.length} chars`);
@@ -205,6 +213,7 @@ export function createSandboxedTools(workspaceDir: string, logger?: Logger) {
             }
             content = content.replace(edit.oldText, edit.newText);
           }
+          assertWriteAllowed(guard);
           await fsPromises.writeFile(resolved, content, "utf-8");
           logger?.debug?.(`${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${content.length} chars`);
           return JSON.stringify({ success: true });

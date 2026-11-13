@@ -5,8 +5,9 @@
  *
  * End line (one per scope that reached the generator, emitted from the
  * runner's `finally`):
- *   persona_generation_end scope=.. attempt=.. outcome=.. reason=.. nudged=..
- *   runnerCalls=.. finalChars=.. overLimit=.. elapsedMs=..
+ *   persona_generation_end scope=.. attempt=.. outcome=.. rawOutcome=..
+ *   reason=.. invokedRunner=.. runnerCalls=.. nudged=.. nudgeSkipped=..
+ *   finalChars=.. overLimit=.. elapsedMs=..
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -161,6 +162,8 @@ describe("/health persona block", () => {
     expect(after!.personaWriteNudges - before!.personaWriteNudges).toBe(1);
     expect(after!.personaWriteNudgeSuccesses - before!.personaWriteNudgeSuccesses).toBe(1);
     expect(after!.personaOverLimit - before!.personaOverLimit).toBe(0);
+    expect(after!.personaScopeEnds - before!.personaScopeEnds).toBe(1);
+    expect(after!.personaWriteNudgesSkipped - before!.personaWriteNudgesSkipped).toBe(0);
   });
 });
 

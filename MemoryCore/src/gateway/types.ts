@@ -45,13 +45,17 @@ export interface HealthResponse {
   /**
    * L3 persona generations of the process since start (additive field):
    * generations that called the LLM, write nudges sent, nudges that led to a
-   * written and successful generation, and generations over the length limit.
+   * written and successful generation, generations over the length limit,
+   * scope runs that ended with an outcome other than skipped (with or without
+   * an LLM call), and nudges skipped for lack of time (additive fields).
    */
   persona: {
     personaGenerations: number;
     personaWriteNudges: number;
     personaWriteNudgeSuccesses: number;
     personaOverLimit: number;
+    personaScopeEnds: number;
+    personaWriteNudgesSkipped: number;
   };
   /** Integrated services status (only present when state_backend is configured) */
   services?: {

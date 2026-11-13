@@ -5,11 +5,20 @@
  * One generation ("lần sinh") is bounded by a total deadline (`deadlineAt`):
  * the first runner call and the optional write nudge share it. A caller
  * abort signal reaches every runner call and blocks the final persona write.
+ * Two floors cut a call that could not finish anyway: with less than
+ * `minRunnerMs` left the first call is not made, with less than `minNudgeMs`
+ * left the nudge is skipped; both end the generation with reason=deadline.
+ *
+ * A runner call "wrote" persona.md when the persona tools saw a successful
+ * write/edit (positive evidence, independent of the backend's `stat`) or the
+ * file's write marker moved to a readable value (runners without the persona
+ * tools, which write the file directly). A call that did not write gets one
+ * nudge, at a cold start too.
  */
 
-import type { MemoryPromptMode } from "../../config.js";
+import { defaultPersonaMinNudgeMs, defaultPersonaMinRunnerMs, type MemoryPromptMode } from "../../config.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
-import { CheckpointManager } from "../../utils/checkpoint.js";
+import { CheckpointManager, CheckpointWriteRejectedError } from "../../utils/checkpoint.js";
 import { readSceneIndex } from "../scene/scene-index.js";
 import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
 import { buildPersonaPrompt, personaMaxCharsFor } from "../prompts/persona-generation.js";
@@ -57,8 +66,10 @@ export interface PersonaGenerationDetail {
   reason: PersonaGenerationReason;
   /** A second, nudging runner call was made. */
   nudged: boolean;
-  /** The nudge call changed persona.md (marker moved on call 2). */
+  /** The nudge call wrote persona.md (tool evidence or a moved marker) and it is readable. */
   nudgeWrote: boolean;
+  /** Call 1 did not write, but less than minNudgeMs was left: no nudge was sent. */
+  nudgeSkipped: boolean;
   /** At least one runner call was made (definition of a counted generation). */
   invokedRunner: boolean;
   /** Runner calls made (0, 1 or 2). */
@@ -73,6 +84,8 @@ export interface PersonaGenerationDetail {
 export interface PersonaToolset {
   tools: Record<string, unknown>;
   violated(): boolean;
+  /** Successful write/edit calls to persona.md so far (absent: no tool evidence). */
+  writesObserved?(): number;
 }
 
 export class PersonaGenerator {
@@ -88,6 +101,8 @@ export class PersonaGenerator {
   private toolset: PersonaToolset | undefined;
   private abortSignal: AbortSignal | undefined;
   private deadlineAt: number | undefined;
+  private minRunnerMs: number;
+  private minNudgeMs: number;
   private maxChars: number;
   private maxCharsChat: number | undefined;
   private maxCharsCode: number | undefined;
@@ -123,6 +138,13 @@ export class PersonaGenerator {
     abortSignal?: AbortSignal;
     /** Absolute ms epoch: total deadline of the generation, nudge included. */
     deadlineAt?: number;
+    /**
+     * Least ms left to start call 1 / to send the nudge. Default: derived from
+     * the budget (deadlineAt - now, or DEFAULT_PERSONA_TIMEOUT_MS) like the
+     * config defaults: min(30000, budget/6) and min(20000, budget/9).
+     */
+    minRunnerMs?: number;
+    minNudgeMs?: number;
     /** Persona body length limits per prompt mode (characters, default 6000). */
     maxCharsChat?: number;
     maxCharsCode?: number;
@@ -138,6 +160,11 @@ export class PersonaGenerator {
     this.toolset = opts.tools;
     this.abortSignal = opts.abortSignal;
     this.deadlineAt = opts.deadlineAt;
+    const budgetMs = opts.deadlineAt !== undefined
+      ? Math.max(0, opts.deadlineAt - Date.now())
+      : DEFAULT_PERSONA_TIMEOUT_MS;
+    this.minRunnerMs = opts.minRunnerMs ?? defaultPersonaMinRunnerMs(budgetMs);
+    this.minNudgeMs = opts.minNudgeMs ?? defaultPersonaMinNudgeMs(budgetMs);
     this.maxCharsChat = opts.maxCharsChat;
     this.maxCharsCode = opts.maxCharsCode;
     this.maxChars = personaMaxCharsFor(this.promptMode, opts);
@@ -164,11 +191,15 @@ export class PersonaGenerator {
    * counts once per generation.
    */
   async generateLocalPersonaDetailed(triggerReason?: string): Promise<PersonaGenerationDetail> {
+    return this.runGeneration(triggerReason, this.deadlineAt ?? Date.now() + DEFAULT_PERSONA_TIMEOUT_MS);
+  }
+
+  private async runGeneration(triggerReason: string | undefined, deadlineAt: number): Promise<PersonaGenerationDetail> {
     const startMs = Date.now();
-    const deadlineAt = this.deadlineAt ?? startMs + DEFAULT_PERSONA_TIMEOUT_MS;
     let runnerCalls = 0;
     let nudged = false;
     let nudgeWrote = false;
+    let nudgeSkipped = false;
     const done = (
       outcome: PersonaGenerationOutcome,
       reason: PersonaGenerationReason,
@@ -178,6 +209,7 @@ export class PersonaGenerator {
       reason,
       nudged,
       nudgeWrote,
+      nudgeSkipped,
       invokedRunner: runnerCalls > 0,
       runnerCalls,
       finalChars: extra.finalChars,
@@ -274,7 +306,7 @@ export class PersonaGenerator {
       ? StoragePaths.checkpoint
       : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, ".metadata", "recall_checkpoint.json"); })();
 
-    const { systemPrompt: baseSystemPrompt, userPrompt } = buildPersonaPrompt({
+    const promptParams = {
       mode,
       promptMode: this.promptMode,
       currentTime: new Date().toISOString(),
@@ -282,18 +314,31 @@ export class PersonaGenerator {
       sceneCount: index.length,
       changedSceneCount: changedScenes.length,
       changedScenesContent,
-      existingPersona,
       triggerInfo: triggerReason,
       personaFilePath,
       checkpointPath,
       maxCharsChat: this.maxCharsChat,
       maxCharsCode: this.maxCharsCode,
-      // Same object the post-write check measures: body after strip + escape.
-      existingPersonaChars: existingPersona ? escapeXmlTags(existingPersona).length : undefined,
-    });
+    } as const;
+    // existingPersona is already stripped + trimmed; its length is measured
+    // the way the post-write check measures the new body: after escape.
+    const { systemPrompt: baseSystemPrompt, userPrompt } = existingPersona !== undefined
+      ? buildPersonaPrompt({ ...promptParams, existingPersona, existingPersonaChars: escapeXmlTags(existingPersona).length })
+      : buildPersonaPrompt(promptParams);
     const systemPrompt = composeMemorySystemPrompt(baseSystemPrompt, this.memoryPrompt);
 
-    // 7. Backup before LLM run (LLM writes persona.md via tools)
+    // 7. A first call needs at least minRunnerMs of the deadline to finish:
+    // with less, stop before any write (backup included) and any runner call.
+    if (this.abortSignal?.aborted) return done("failed", "aborted");
+    if (deadlineAt - Date.now() < this.minRunnerMs) {
+      this.logger?.error(
+        `${TAG} ${Math.max(0, deadlineAt - Date.now())}ms left of the generation deadline, below minRunnerMs=${this.minRunnerMs}; ` +
+        `no runner call, preserving checkpoint for retry`,
+      );
+      return done("failed", "deadline");
+    }
+
+    // Backup before LLM run (LLM writes persona.md via tools)
     const bm = new BackupManager(this.storage
       ? undefined  // COS mode: BackupManager not used (TODO: adapt BackupManager for StorageAdapter)
       : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, ".backup"); })()
@@ -337,21 +382,28 @@ export class PersonaGenerator {
       } catch (err) {
         const elapsedMs = Date.now() - startMs;
         this.logger?.error(`${TAG} Persona generation failed after ${elapsedMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-        return classifyRunError(err, this.abortSignal);
+        return classifyRunError(err, this.abortSignal, deadlineAt);
       }
     };
 
+    // Did the runner call that started at `writesBefore` write persona.md?
+    // Positive tool evidence first (works without `stat`); else a marker that
+    // moved to a readable value (runners that write the file directly). A
+    // marker that became unreadable is not evidence of a write.
+    const writesObserved = (): number => this.toolset?.writesObserved?.() ?? 0;
+    const callWrote = async (writesBefore: number): Promise<boolean> => {
+      if (writesObserved() > writesBefore) return true;
+      const markerAfter = await readPersonaWriteMarker(this.dataDir, targetFile, this.storage);
+      return markerAfter !== undefined && markerAfter !== personaWriteMarkerBefore;
+    };
+
+    const writesBeforeCall1 = writesObserved();
     const firstFailure = await runOnce(userPrompt);
     if (firstFailure) return done("failed", firstFailure);
     if (this.toolset?.violated()) {
       this.logger?.error(`${TAG} LLM tried to write outside ${targetFile}; generation failed`);
       return done("failed", "write-error");
     }
-    let personaWriteMarkerAfter = await readPersonaWriteMarker(
-      this.dataDir,
-      targetFile,
-      this.storage,
-    );
 
     // 9. Read LLM-written persona.md and apply post-processing
     const readPersona = async (): Promise<string | undefined> => {
@@ -368,44 +420,43 @@ export class PersonaGenerator {
         return undefined;
       }
     };
-    let personaText = await readPersona();
-    if (personaText === undefined) {
-      // LLM failed to write persona.md — treat as failure
-      this.logger?.error(`${TAG} LLM did not write ${targetFile} — file not found after runner completed`);
-      return done("failed", "no-write");
-    }
-    if (
-      existingPersona &&
-      personaWriteMarkerBefore &&
-      personaWriteMarkerAfter === personaWriteMarkerBefore
-    ) {
-      // The model ended without write/edit: one nudge, inside the same deadline.
+    let personaText: string | undefined;
+    if (await callWrote(writesBeforeCall1)) {
+      personaText = await readPersona();
+      if (personaText === undefined) {
+        this.logger?.error(`${TAG} LLM did not write ${targetFile} — file not found after runner completed`);
+        return done("failed", "no-write");
+      }
+    } else {
+      // The model ended without write/edit (a cold start included): one
+      // nudge, inside the same deadline, if there is time to finish it.
       this.logger?.warn(`${TAG} LLM completed without writing ${targetFile}; nudging once to call write/edit`);
       if (this.abortSignal?.aborted) return done("failed", "aborted");
-      if (deadlineAt - Date.now() <= 0) {
-        this.logger?.error(`${TAG} No time left for the write nudge; preserving checkpoint for retry`);
+      if (deadlineAt - Date.now() < this.minNudgeMs) {
+        nudgeSkipped = true;
+        this.logger?.error(
+          `${TAG} ${Math.max(0, deadlineAt - Date.now())}ms left, below minNudgeMs=${this.minNudgeMs}; ` +
+          `write nudge skipped, preserving checkpoint for retry`,
+        );
         return done("failed", "deadline");
       }
       nudged = true;
+      const writesBeforeNudge = writesObserved();
       const nudgeFailure = await runOnce(`${userPrompt}${PERSONA_WRITE_NUDGE}`);
       if (nudgeFailure) return done("failed", nudgeFailure);
       if (this.toolset?.violated()) {
         this.logger?.error(`${TAG} LLM tried to write outside ${targetFile}; generation failed`);
         return done("failed", "write-error");
       }
-      personaWriteMarkerAfter = await readPersonaWriteMarker(this.dataDir, targetFile, this.storage);
-      if (personaWriteMarkerAfter === personaWriteMarkerBefore) {
+      const nudgeCallWrote = await callWrote(writesBeforeNudge);
+      personaText = await readPersona();
+      if (!nudgeCallWrote || personaText === undefined) {
         this.logger?.error(
           `${TAG} LLM completed without writing ${targetFile} after the nudge; preserving checkpoint for retry`,
         );
         return done("failed", "no-write");
       }
       nudgeWrote = true;
-      personaText = await readPersona();
-      if (personaText === undefined) {
-        this.logger?.error(`${TAG} LLM did not write ${targetFile} — file not found after the nudge`);
-        return done("failed", "no-write");
-      }
     }
 
     // 10. Strip any navigation the LLM might have added + sanitize for safe injection
@@ -492,23 +543,43 @@ export class PersonaGenerator {
    * Backward-compatible wrapper: local generation + checkpoint advance.
    */
   async generate(triggerReason?: string): Promise<boolean> {
-    const result = await this.generateLocalPersona(triggerReason);
-    if (result !== "generated") return false;
+    // One deadline for the generation and the checkpoint advance after it.
+    const deadlineAt = this.deadlineAt ?? Date.now() + DEFAULT_PERSONA_TIMEOUT_MS;
+    const detail = await this.runGeneration(triggerReason, deadlineAt);
+    if (detail.outcome !== "generated") return false;
 
     const cpManager = new CheckpointManager(this.dataDir, this.logger, this.storage);
     const cp = await cpManager.read();
-    await cpManager.markPersonaGenerated(cp.total_processed);
+    try {
+      await cpManager.markPersonaGenerated(cp.total_processed, { signal: this.abortSignal, deadlineAt });
+    } catch (err) {
+      if (!(err instanceof CheckpointWriteRejectedError)) throw err;
+      this.logger?.error(`${TAG} Checkpoint advance refused (${err.rejection}); checkpoint unchanged`);
+      return false;
+    }
     return true;
   }
 }
 
-/** Map a runner error to the closed reason enum. */
-function classifyRunError(err: unknown, signal: AbortSignal | undefined): PersonaGenerationReason {
+/** The error carries a numeric HTTP status (provider answered with an error). */
+function hasHttpStatus(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { statusCode?: unknown; status?: unknown };
+  return typeof e.statusCode === "number" || typeof e.status === "number";
+}
+
+/**
+ * Map a runner error to the closed reason enum, in a fixed order: a caller
+ * abort, then the generation deadline, then an HTTP error from the provider
+ * (whatever its message says), then a timeout/abort error before the
+ * deadline; anything else is a provider error.
+ */
+function classifyRunError(err: unknown, signal: AbortSignal | undefined, deadlineAt: number): PersonaGenerationReason {
   if (signal?.aborted) return "aborted";
+  if (Date.now() >= deadlineAt) return "deadline";
+  if (hasHttpStatus(err)) return "provider-error";
   const name = err instanceof Error ? err.name : "";
   const message = err instanceof Error ? err.message : String(err);
-  // The runner's own timeout aborts the call (AbortSignal.timeout): with no
-  // caller abort, an abort/timeout error is the generation timing out.
   if (name === "TimeoutError" || name === "AbortError" || /time[d]?[\s-]?out/i.test(message)) return "timeout";
   return "provider-error";
 }
