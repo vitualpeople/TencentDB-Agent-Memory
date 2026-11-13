@@ -51,6 +51,7 @@ import {
   getL0EmbeddingFailed,
   llmProviderHealth,
 } from "../core/report/provider-health-telemetry.js";
+import { personaGenerationTelemetry } from "../core/report/persona-generation-telemetry.js";
 import type { Logger } from "../core/types.js";
 import { InstanceConfigProvider } from "../core/instance-config-provider.js";
 import { wrapWithTrace } from "../core/report/trace-middleware.js";
@@ -1396,6 +1397,7 @@ export class TdaiGateway {
         embedding: { ...embeddingProviderHealth.snapshot(), l0EmbeddingFailed: getL0EmbeddingFailed() },
         llm: llmProviderHealth.snapshot(),
       },
+      persona: personaGenerationTelemetry.snapshot(),
       // Integrated services status
       services: {
         timerScanner: this.timerScanner?.getMetrics() ?? null,
@@ -1863,6 +1865,8 @@ export class TdaiGateway {
       concurrency: this.config.worker.concurrency,
       // Re-run a dead-lettered L1 slice later, with no new message needed
       deadLetterRetryDelayMs: this.config.worker.deadLetterRetryDelayMs,
+      // L3 retries apart from L1/L2: one L3 attempt already includes the write nudge
+      l3MaxRetries: this.config.worker.l3MaxRetries,
       // L1 完成后推进 L2 timer（快路径：L1完成 → delay秒后触发L2）
       onL1Complete: statefulManager.advanceL2TimerAfterL1.bind(statefulManager),
       // L2 完成后设置 maxInterval 兜底 timer

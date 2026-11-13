@@ -51,7 +51,17 @@ import {
 } from "./manifest.js";
 import { SceneExtractor } from "../core/scene/scene-extractor.js";
 import { PersonaTrigger } from "../core/persona/persona-trigger.js";
-import { PersonaGenerator } from "../core/persona/persona-generator.js";
+import {
+  DEFAULT_PERSONA_TIMEOUT_MS,
+  PersonaGenerator,
+  type PersonaGenerationDetail,
+  type PersonaGenerationReason,
+} from "../core/persona/persona-generator.js";
+import { createPersonaWriteTools } from "../adapters/standalone/persona-tools.js";
+import {
+  personaGenerationTelemetry,
+  type PersonaGenerationSink,
+} from "../core/report/persona-generation-telemetry.js";
 import {
   evaluateL3JevGate,
   JEV_PROMPT_VERSION,
@@ -1170,8 +1180,11 @@ export function createL3Runner(opts: {
   /** StorageAdapter for file operations (COS/local). */
   storage?: StorageAdapter;
   checkpointLock?: import("./checkpoint.js").CheckpointLockOptions;
+  /** Persona generation counters (default: the process-wide sink /health reads). */
+  personaTelemetry?: PersonaGenerationSink;
 }): ((context?: L3JevExecutionContext) => Promise<void>) {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner, storage } = opts;
+  const personaTelemetry = opts.personaTelemetry ?? personaGenerationTelemetry;
 
   return async (context?: L3JevExecutionContext) => {
     const scopes = await discoverProfileScopes(pluginDataDir, storage, logger);
@@ -1324,6 +1337,11 @@ export function createL3Runner(opts: {
         agentId: scopeIsolation.agentId,
         layer: "l3",
       }));
+      // One generation = one total deadline (nudge included). The worker's
+      // abort signal and that deadline also guard the checkpoint write.
+      const deadlineAt = Date.now() + (cfg.persona.timeoutMs ?? DEFAULT_PERSONA_TIMEOUT_MS);
+      const checkpointGuard = { signal: context?.signal, deadlineAt };
+      const personaTools = createPersonaWriteTools({ workspaceDir: scopedDir, storage: scopedStore, logger });
       const generator = new PersonaGenerator({
         dataDir: scopedDir,
         config: openclawConfig,
@@ -1336,126 +1354,201 @@ export function createL3Runner(opts: {
         llmRunner,
         storage: scopedStore,
         traceContext: scopeIsolation,
+        tools: personaTools,
+        abortSignal: context?.signal,
+        deadlineAt,
+        maxCharsChat: cfg.persona.maxCharsChat,
+        maxCharsCode: cfg.persona.maxCharsCode,
       });
-      const genResult = await generator.generateLocalPersona(generationReason);
+      let genDetail: PersonaGenerationDetail | undefined;
+      // Set when the scope fails after the generator returned (checkpoint, sync).
+      let failedAfterGenerator: PersonaGenerationReason | undefined;
+      try {
+        genDetail = await generator.generateLocalPersonaDetailed(generationReason);
+        const genResult = genDetail.outcome === "skipped" ? "unchanged" : genDetail.outcome;
 
-      const checkpoint = new CheckpointManager(scopedDir, logger, scopedStore, opts.checkpointLock);
-      const cp = await checkpoint.read();
-      const personaMarker = cp.total_processed;
+        const checkpoint = new CheckpointManager(scopedDir, logger, scopedStore, opts.checkpointLock);
+        const cp = await checkpoint.read();
+        const personaMarker = cp.total_processed;
+        const markPersonaGenerated = async (): Promise<void> => {
+          try {
+            await checkpoint.markPersonaGenerated(personaMarker, checkpointGuard);
+          } catch (err) {
+            failedAfterGenerator = "checkpoint-rejected";
+            throw err;
+          }
+        };
 
-      if (genResult === "failed") {
-        emitCheckpointDiagnostic({
-          logger, cfg, instanceId, context, gateId, scopeIsolation,
-          generationResult: "failed", checkpointBefore: cp.last_persona_time,
-          checkpointAfter: cp.last_persona_time, advanceReason: "generation_failed",
-          personaBeforeHash,
-          personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
-          scopeStartedAt, jevAddedLockMs,
+        if (genResult === "failed") {
+          emitCheckpointDiagnostic({
+            logger, cfg, instanceId, context, gateId, scopeIsolation,
+            generationResult: "failed", checkpointBefore: cp.last_persona_time,
+            checkpointAfter: cp.last_persona_time, advanceReason: "generation_failed",
+            personaBeforeHash,
+            personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
+            scopeStartedAt, jevAddedLockMs,
+          });
+          throw new Error(`${TAG} [L3] Persona generation failed (scope=${scope})`);
+        }
+        if (genResult === "unchanged") {
+          logger.info(`${TAG} [L3] Persona generation skipped (no changes, scope=${scope})`);
+          await markPersonaGenerated();
+          const after = await checkpoint.read();
+          emitCheckpointDiagnostic({
+            logger, cfg, instanceId, context, gateId, scopeIsolation,
+            generationResult: "unchanged", checkpointBefore: cp.last_persona_time,
+            checkpointAfter: after.last_persona_time, advanceReason: "generator_unchanged",
+            personaBeforeHash,
+            personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
+            scopeStartedAt, jevAddedLockMs,
+          });
+          continue;
+        }
+
+        const l3FinishedAt = Date.now();
+        const l3PromptRef = buildPromptGenerationRef(resolvedL3Prompt, "l3");
+        let changedProfiles = (await listLocalProfiles(scopedDir, scopedStore, profileOptions))
+          .filter((profile) => profileBaseline.get(profile.id)?.contentMd5 !== profile.contentMd5 || !profileBaseline.has(profile.id));
+        if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
+          changedProfiles = (await syncLocalProfilesToStore(
+            scopedDir, vectorStore, profileBaseline, logger, scopedStore, profileOptions,
+          )) ?? changedProfiles;
+        }
+        if (changedProfiles.length === 0) {
+          logger.debug?.(`${TAG} [L3] No changed Persona profiles, skipping generation provenance`);
+          await markPersonaGenerated();
+          const checkpointAfterSync = await checkpoint.read();
+          emitCheckpointDiagnostic({
+            logger, cfg, instanceId, context, gateId, scopeIsolation,
+            generationResult: "generated",
+            checkpointBefore: cp.last_persona_time,
+            checkpointAfter: checkpointAfterSync.last_persona_time,
+            advanceReason: "generation_succeeded_no_profile_diff",
+            personaBeforeHash,
+            personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
+            scopeStartedAt,
+            jevAddedLockMs,
+          });
+          generatedAny = true;
+          continue;
+        }
+        const l3Identity = buildGenerationLogIdentity("l3", l3FinishedAt, changedProfiles[0]?.id);
+        const l3Provenance = buildGenerationProvenance(l3Identity, l3PromptRef);
+        const rootStorage = storage ?? new StorageAdapter(new LocalStorageBackend(pluginDataDir));
+        const l3Log: MemoryGenerationLog = {
+          schema_version: 1,
+          log_id: l3Identity.logId,
+          generation_id: l3Identity.generationId,
+          instance_id: instanceId ?? "standalone",
+          layer: "l3",
+          status: "succeeded",
+          team_id: scopeIsolation.teamId,
+          agent_id: scopeIsolation.agentId,
+          user_id: scopeIsolation.userId,
+          session_id: scopeIsolation.sessionId,
+          prompt: l3PromptRef,
+          anchor_memory_id: changedProfiles[0]?.id,
+          input_refs: sceneIndex.map((scene) => ({ layer: "l2", record_id: scene.filename })),
+          output_refs: changedProfiles.map((profile) => ({ layer: "l3", record_id: profile.id })),
+          model: cfg.persona.model,
+          prompt_mode: cfg.persona.promptMode,
+          started_at_ms: l3StartMs,
+          finished_at_ms: l3FinishedAt,
+          latency_ms: l3FinishedAt - l3StartMs,
+        };
+        const l3LogStore = new MemoryGenerationLogStore(rootStorage, instanceId ?? "standalone");
+        await writeGenerationProvenanceBestEffort({
+          layer: "l3",
+          logger,
+          writeLog: () => l3LogStore.write(l3Log, l3Identity.key),
+          writeRefs: vectorStore?.upsertMemoryGenerationRefs && changedProfiles.length > 0
+            ? () => vectorStore.upsertMemoryGenerationRefs!(changedProfiles.map((profile) => ({
+                generation_ref_id: buildMemoryGenerationRefId("l3", profile.id),
+                layer: "l3" as const,
+                memory_id: profile.id,
+                ...l3Provenance,
+                created_at_ms: l3FinishedAt,
+              })))
+            : undefined,
         });
-        throw new Error(`${TAG} [L3] Persona generation failed (scope=${scope})`);
-      }
-      if (genResult === "unchanged") {
-        logger.info(`${TAG} [L3] Persona generation skipped (no changes, scope=${scope})`);
-        await checkpoint.markPersonaGenerated(personaMarker);
-        const after = await checkpoint.read();
-        emitCheckpointDiagnostic({
-          logger, cfg, instanceId, context, gateId, scopeIsolation,
-          generationResult: "unchanged", checkpointBefore: cp.last_persona_time,
-          checkpointAfter: after.last_persona_time, advanceReason: "generator_unchanged",
-          personaBeforeHash,
-          personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
-          scopeStartedAt, jevAddedLockMs,
-        });
-        continue;
-      }
 
-      const l3FinishedAt = Date.now();
-      const l3PromptRef = buildPromptGenerationRef(resolvedL3Prompt, "l3");
-      let changedProfiles = (await listLocalProfiles(scopedDir, scopedStore, profileOptions))
-        .filter((profile) => profileBaseline.get(profile.id)?.contentMd5 !== profile.contentMd5 || !profileBaseline.has(profile.id));
-      if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-        changedProfiles = (await syncLocalProfilesToStore(
-          scopedDir, vectorStore, profileBaseline, logger, scopedStore, profileOptions,
-        )) ?? changedProfiles;
-      }
-      if (changedProfiles.length === 0) {
-        logger.debug?.(`${TAG} [L3] No changed Persona profiles, skipping generation provenance`);
-        await checkpoint.markPersonaGenerated(personaMarker);
-        const checkpointAfterSync = await checkpoint.read();
+        await markPersonaGenerated();
+        const checkpointAfterGeneration = await checkpoint.read();
         emitCheckpointDiagnostic({
           logger, cfg, instanceId, context, gateId, scopeIsolation,
-          generationResult: "generated",
-          checkpointBefore: cp.last_persona_time,
-          checkpointAfter: checkpointAfterSync.last_persona_time,
-          advanceReason: "generation_succeeded_no_profile_diff",
+          generationResult: "generated", checkpointBefore: cp.last_persona_time,
+          checkpointAfter: checkpointAfterGeneration.last_persona_time,
+          advanceReason: "generation_succeeded",
           personaBeforeHash,
           personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
           scopeStartedAt,
           jevAddedLockMs,
         });
         generatedAny = true;
-        continue;
+        logger.info(`${TAG} [L3] Persona generation succeeded (scope=${scope})`);
+      } catch (err) {
+        // The generator returned but the scope failed afterwards (profile
+        // sync, provenance, checkpoint): record why for the end line.
+        if (!failedAfterGenerator && genDetail?.outcome !== "failed") {
+          failedAfterGenerator = context?.signal?.aborted ? "aborted" : "write-error";
+        }
+        throw err;
+      } finally {
+        // The single end-of-generation line and counter update for this scope.
+        recordPersonaGenerationEnd({
+          logger,
+          sink: personaTelemetry,
+          scope,
+          attemptId: context?.l3TaskId,
+          detail: genDetail,
+          failedAfterGenerator,
+          elapsedMs: Date.now() - l3StartMs,
+        });
       }
-      const l3Identity = buildGenerationLogIdentity("l3", l3FinishedAt, changedProfiles[0]?.id);
-      const l3Provenance = buildGenerationProvenance(l3Identity, l3PromptRef);
-      const rootStorage = storage ?? new StorageAdapter(new LocalStorageBackend(pluginDataDir));
-      const l3Log: MemoryGenerationLog = {
-        schema_version: 1,
-        log_id: l3Identity.logId,
-        generation_id: l3Identity.generationId,
-        instance_id: instanceId ?? "standalone",
-        layer: "l3",
-        status: "succeeded",
-        team_id: scopeIsolation.teamId,
-        agent_id: scopeIsolation.agentId,
-        user_id: scopeIsolation.userId,
-        session_id: scopeIsolation.sessionId,
-        prompt: l3PromptRef,
-        anchor_memory_id: changedProfiles[0]?.id,
-        input_refs: sceneIndex.map((scene) => ({ layer: "l2", record_id: scene.filename })),
-        output_refs: changedProfiles.map((profile) => ({ layer: "l3", record_id: profile.id })),
-        model: cfg.persona.model,
-        prompt_mode: cfg.persona.promptMode,
-        started_at_ms: l3StartMs,
-        finished_at_ms: l3FinishedAt,
-        latency_ms: l3FinishedAt - l3StartMs,
-      };
-      const l3LogStore = new MemoryGenerationLogStore(rootStorage, instanceId ?? "standalone");
-      await writeGenerationProvenanceBestEffort({
-        layer: "l3",
-        logger,
-        writeLog: () => l3LogStore.write(l3Log, l3Identity.key),
-        writeRefs: vectorStore?.upsertMemoryGenerationRefs && changedProfiles.length > 0
-          ? () => vectorStore.upsertMemoryGenerationRefs!(changedProfiles.map((profile) => ({
-              generation_ref_id: buildMemoryGenerationRefId("l3", profile.id),
-              layer: "l3" as const,
-              memory_id: profile.id,
-              ...l3Provenance,
-              created_at_ms: l3FinishedAt,
-            })))
-          : undefined,
-      });
-
-      await checkpoint.markPersonaGenerated(personaMarker);
-      const checkpointAfterGeneration = await checkpoint.read();
-      emitCheckpointDiagnostic({
-        logger, cfg, instanceId, context, gateId, scopeIsolation,
-        generationResult: "generated", checkpointBefore: cp.last_persona_time,
-        checkpointAfter: checkpointAfterGeneration.last_persona_time,
-        advanceReason: "generation_succeeded",
-        personaBeforeHash,
-        personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
-        scopeStartedAt,
-        jevAddedLockMs,
-      });
-      generatedAny = true;
-      logger.info(`${TAG} [L3] Persona generation succeeded (scope=${scope})`);
     }
 
     if (!generatedAny) {
       logger.debug?.(`${TAG} [L3] No scoped persona generated`);
     }
   };
+}
+
+/**
+ * Emit the one end-of-generation log line for a scope and record the same
+ * generation in the persona sink. Never logs persona content.
+ *
+ * Format (one line, key=value):
+ *   [memory-tdai] [pipeline-factory] [L3] persona_generation_end scope=<scope>
+ *   attempt=<l3TaskId|none> outcome=<generated|unchanged|failed|skipped>
+ *   reason=<no-write|timeout|provider-error|aborted|deadline|checkpoint-rejected|write-error|none>
+ *   nudged=<bool> runnerCalls=<0..2> finalChars=<n|none> overLimit=<bool> elapsedMs=<n>
+ */
+function recordPersonaGenerationEnd(input: {
+  logger: PipelineLogger;
+  sink: PersonaGenerationSink;
+  scope: string;
+  attemptId?: string;
+  detail?: PersonaGenerationDetail;
+  failedAfterGenerator?: PersonaGenerationReason;
+  elapsedMs: number;
+}): void {
+  const d = input.detail;
+  const outcome = input.failedAfterGenerator ? "failed" : d?.outcome ?? "failed";
+  const reason: PersonaGenerationReason = input.failedAfterGenerator ?? d?.reason ?? "write-error";
+  const invokedRunner = d?.invokedRunner ?? false;
+  const nudged = d?.nudged ?? false;
+  input.sink.record({
+    invokedRunner,
+    nudged,
+    nudgeSucceeded: nudged && (d?.nudgeWrote ?? false) && outcome !== "failed",
+    overLimit: d?.overLimit ?? false,
+  });
+  const line =
+    `${TAG} [L3] persona_generation_end scope=${input.scope} attempt=${input.attemptId ?? "none"} ` +
+    `outcome=${outcome} reason=${reason} nudged=${nudged} runnerCalls=${d?.runnerCalls ?? 0} ` +
+    `finalChars=${d?.finalChars ?? "none"} overLimit=${d?.overLimit ?? false} elapsedMs=${input.elapsedMs}`;
+  if (outcome === "failed") input.logger.warn(line);
+  else input.logger.info(line);
 }
 
 function emitCheckpointDiagnostic(input: {

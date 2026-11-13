@@ -107,7 +107,7 @@ export interface StandaloneLLMConfig {
 // Sandboxed tool execution helpers
 // ============================
 
-function resolveSandboxedPath(workspaceDir: string, relativePath: string): string | null {
+export function resolveSandboxedPath(workspaceDir: string, relativePath: string): string | null {
   const resolved = path.resolve(workspaceDir, relativePath);
   if (!resolved.startsWith(path.resolve(workspaceDir))) {
     return null;
@@ -119,7 +119,7 @@ function resolveSandboxedPath(workspaceDir: string, relativePath: string): strin
 // Tool definitions (Vercel AI SDK `tool()` format)
 // ============================
 
-function createSandboxedTools(workspaceDir: string, logger?: Logger) {
+export function createSandboxedTools(workspaceDir: string, logger?: Logger) {
   return {
     read: tool({
       description: "Read the contents of a file at the given relative path.",

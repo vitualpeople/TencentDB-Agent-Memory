@@ -68,8 +68,14 @@ export interface PipelineWorkerConfig {
   lockTtlMs?: number;
   /** 锁续约间隔 ms (default: 30000 = TTL 的 1/8，避免续约失败) */
   lockRenewIntervalMs?: number;
-  /** 最大重试次数 (default: 3) */
+  /** 最大重试次数 (default: 3). L1, L2 and every non-L3 task. */
   maxRetries?: number;
+  /**
+   * Retries of an L3 (persona) task (default: DEFAULT_L3_MAX_RETRIES = 1).
+   * One L3 attempt can already make two LLM calls (the write nudge) inside
+   * one persona deadline, so L3 gets a smaller budget than L1/L2.
+   */
+  l3MaxRetries?: number;
   /** 重试基础延迟 ms (default: 5000, 指数退避) */
   retryBaseDelayMs?: number;
   /** Pending 消息回收间隔 ms (default: 30000) */
@@ -126,6 +132,9 @@ export interface PipelineWorkerConfig {
  * coming back.
  */
 export const DEFAULT_DEAD_LETTER_RETRY_DELAY_MS = 15 * 60_000;
+
+/** Default retries of an L3 task: 1 + 1 attempts, each bounded by the persona deadline. */
+export const DEFAULT_L3_MAX_RETRIES = 1;
 
 /**
  * Consecutive dead-letters of one frozen L1 slice, all caused by parse
@@ -289,6 +298,7 @@ export class PipelineWorker {
       lockTtlMs: config?.lockTtlMs ?? 600000,
       lockRenewIntervalMs: config?.lockRenewIntervalMs ?? 30000,
       maxRetries: config?.maxRetries ?? 3,
+      l3MaxRetries: config?.l3MaxRetries ?? DEFAULT_L3_MAX_RETRIES,
       retryBaseDelayMs: config?.retryBaseDelayMs ?? 5000,
       pendingRecoveryIntervalMs: config?.pendingRecoveryIntervalMs ?? 30000,
       pendingStaleMs: config?.pendingStaleMs ?? 300000,
@@ -427,9 +437,10 @@ export class PipelineWorker {
         const errMsg = err instanceof Error ? err.message : String(err);
         this.metrics.tasksFailed++;
 
-        if (retryCount < this.config.maxRetries) {
+        const maxRetries = this.maxRetriesFor(task);
+        if (retryCount < maxRetries) {
           const delay = this.config.retryBaseDelayMs * Math.pow(3, retryCount);
-          this.logger.warn(`${TAG} Task failed (lock-free, retry ${retryCount + 1}/${this.config.maxRetries}, delay=${delay}ms): ${errMsg}`);
+          this.logger.warn(`${TAG} Task failed (lock-free, retry ${retryCount + 1}/${maxRetries}, delay=${delay}ms): ${errMsg}`);
           const msgId = (task as any)._msgId;
           if (msgId) { try { await this.backend.ackTask(msgId); } catch { /* best effort */ } }
           await this.sleep(delay);
@@ -655,10 +666,11 @@ export class PipelineWorker {
       }
 
       // 指数退避重试
-      if (retryCount < this.config.maxRetries) {
+      const maxRetries = this.maxRetriesFor(task);
+      if (retryCount < maxRetries) {
         const delay = this.config.retryBaseDelayMs * Math.pow(3, retryCount); // 5s, 15s, 45s
         this.logger.warn(
-          `${TAG} Task failed (retry ${retryCount + 1}/${this.config.maxRetries}, delay=${delay}ms): ${errMsg}`,
+          `${TAG} Task failed (retry ${retryCount + 1}/${maxRetries}, delay=${delay}ms): ${errMsg}`,
         );
         // CR-1 fix: ACK the original message before re-enqueue. Otherwise the original
         // msgId stays in XPENDING and gets re-claimed by stale recovery in parallel
@@ -696,6 +708,11 @@ export class PipelineWorker {
         }
       }
     }
+  }
+
+  /** Retry budget of a task, shared by the lock-free and the locked handler. */
+  private maxRetriesFor(task: TaskPayload): number {
+    return task.type === "L3" ? this.config.l3MaxRetries : this.config.maxRetries;
   }
 
   private async executeTask(task: TaskPayload, signal?: AbortSignal): Promise<void> {

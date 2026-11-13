@@ -87,6 +87,21 @@ export interface PersonaConfig {
   triggerMode: PersonaTriggerMode;
   /** Direct System One client configuration used only when triggerMode="jev". */
   jev: PersonaJevConfig;
+  /**
+   * Total deadline of one persona generation in ms, write nudge included
+   * (default 180000; env TDAI_PERSONA_TIMEOUT_MS wins over YAML; 1000..600000).
+   */
+  timeoutMs: number;
+  /**
+   * Persona body length limit in characters for promptMode="chat"
+   * (default 6000; env TDAI_PERSONA_MAX_CHARS_CHAT wins over YAML; 200..50000).
+   */
+  maxCharsChat: number;
+  /**
+   * Persona body length limit in characters for promptMode="code"
+   * (default 6000; env TDAI_PERSONA_MAX_CHARS_CODE wins over YAML; 200..50000).
+   */
+  maxCharsCode: number;
 }
 
 /** Pipeline trigger settings (L1→L2→L3 scheduling). */
@@ -446,6 +461,9 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   if (jevTimeoutMs < 100 || jevTimeoutMs > 60_000) {
     throw new Error("memory.persona.jev.timeoutMs must be between 100 and 60000 milliseconds");
   }
+  const personaTimeoutMs = personaIntSetting(personaGroup, "timeoutMs", "TDAI_PERSONA_TIMEOUT_MS", 180_000, 1_000, 600_000);
+  const personaMaxCharsChat = personaIntSetting(personaGroup, "maxCharsChat", "TDAI_PERSONA_MAX_CHARS_CHAT", 6_000, 200, 50_000);
+  const personaMaxCharsCode = personaIntSetting(personaGroup, "maxCharsCode", "TDAI_PERSONA_MAX_CHARS_CODE", 6_000, 200, 50_000);
   const jevProvider = str(jevGroup, "provider") ?? "jev";
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(jevProvider)) {
     throw new Error(`memory.persona.jev.provider has invalid name "${jevProvider}"`);
@@ -674,6 +692,9 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         ...(jevOptions ? { options: jevOptions } : {}),
         diagnostics: { mode: diagnosticsMode },
       },
+      timeoutMs: personaTimeoutMs,
+      maxCharsChat: personaMaxCharsChat,
+      maxCharsCode: personaMaxCharsCode,
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
@@ -796,6 +817,43 @@ function resolveExactEnvReference(value: string): string {
 function num(src: Record<string, unknown>, key: string): number | undefined {
   const v = src[key];
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * Integer persona setting: the env var (raw string checked before it becomes a
+ * number) wins over the YAML key, else the default. A value that is not an
+ * integer inside [min, max] throws at startup instead of being dropped.
+ */
+function personaIntSetting(
+  group: Record<string, unknown>,
+  key: string,
+  envName: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  let label = `memory.persona.${key}`;
+  const rawEnv = process.env[envName]?.trim();
+  let value: number;
+  if (rawEnv) {
+    label = `${envName} (memory.persona.${key})`;
+    if (!/^-?[0-9]+$/.test(rawEnv)) {
+      throw new Error(`${label} must be an integer between ${min} and ${max}, got "${rawEnv}"`);
+    }
+    value = Number(rawEnv);
+  } else if (group[key] !== undefined && group[key] !== null) {
+    const rawYaml = group[key];
+    if (typeof rawYaml !== "number" || !Number.isFinite(rawYaml)) {
+      throw new Error(`${label} must be a finite number, got ${JSON.stringify(rawYaml)}`);
+    }
+    value = rawYaml;
+  } else {
+    return fallback;
+  }
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${label} must be an integer between ${min} and ${max}, got ${value}`);
+  }
+  return value;
 }
 
 function bool(src: Record<string, unknown>, key: string): boolean | undefined {

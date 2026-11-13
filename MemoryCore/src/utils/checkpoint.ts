@@ -185,6 +185,30 @@ async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<
   }
 }
 
+/** Condition re-checked inside the checkpoint lock right before a write. */
+export interface CheckpointWriteGuard {
+  /** A caller abort (worker lost its lock, shutdown). */
+  signal?: AbortSignal;
+  /** Absolute ms epoch after which the write is refused. */
+  deadlineAt?: number;
+}
+
+/** The guard refused the write: the checkpoint was not changed. */
+export class CheckpointWriteRejectedError extends Error {
+  constructor(public readonly rejection: "aborted" | "deadline") {
+    super(`checkpoint write rejected (${rejection}); checkpoint unchanged`);
+    this.name = "CheckpointWriteRejectedError";
+  }
+}
+
+function assertWriteAllowed(guard: CheckpointWriteGuard | undefined): void {
+  if (!guard) return;
+  if (guard.signal?.aborted) throw new CheckpointWriteRejectedError("aborted");
+  if (guard.deadlineAt !== undefined && Date.now() >= guard.deadlineAt) {
+    throw new CheckpointWriteRejectedError("deadline");
+  }
+}
+
 /**
  * 跨节点互斥所需的最小锁接口。
  *
@@ -367,14 +391,23 @@ export class CheckpointManager {
    * Execute a mutating operation under the per-file lock.
    * `fn` receives the current checkpoint and may modify it in place;
    * the updated checkpoint is atomically written back.
+   *
+   * `guard`, when given, is re-checked inside both locks right before the
+   * write: an aborted signal or a passed deadline throws
+   * CheckpointWriteRejectedError and nothing is written, so a caller that
+   * waited on the lock past its budget cannot still advance the checkpoint.
    */
-  private async mutate(fn: (cp: Checkpoint) => void | Promise<void>): Promise<Checkpoint> {
+  private async mutate(
+    fn: (cp: Checkpoint) => void | Promise<void>,
+    guard?: CheckpointWriteGuard,
+  ): Promise<Checkpoint> {
     // 进程内锁先行：同进程内的并发直接串行，避免无谓的分布式锁往返。
     return withFileLock(this.filePath, () =>
       this.withDistributedLock(async () => {
         // 必须在持有分布式锁后再读，否则读到的仍是他人临界区外的旧快照。
         const cp = await this.readRaw();
         await fn(cp);
+        assertWriteAllowed(guard);
         await this.writeRaw(cp);
         return cp;
       }),
@@ -514,14 +547,19 @@ export class CheckpointManager {
   // Persona methods (L3)
   // ============================
 
-  async markPersonaGenerated(totalProcessed: number): Promise<void> {
+  /**
+   * Advance the persona checkpoint. With `guard`, an abort or a passed
+   * deadline (checked inside the lock, before the write) throws
+   * CheckpointWriteRejectedError and the checkpoint is left as it was.
+   */
+  async markPersonaGenerated(totalProcessed: number, guard?: CheckpointWriteGuard): Promise<void> {
     await this.mutate((cp) => {
       cp.last_persona_at = totalProcessed;
       cp.last_persona_time = new Date().toISOString();
       cp.memories_since_last_persona = 0;
       cp.request_persona_update = false;
       cp.persona_update_reason = "";
-    });
+    }, guard);
   }
 
   async clearPersonaRequest(): Promise<void> {
