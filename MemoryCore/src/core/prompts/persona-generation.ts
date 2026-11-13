@@ -23,6 +23,16 @@ export interface PersonaPromptParams {
   personaFilePath: string;
   /** @deprecated Kept for call-site compatibility; no longer used in prompt. */
   checkpointPath: string;
+  /** Persona body length limit (characters) for promptMode="chat" (default 6000). */
+  maxCharsChat?: number;
+  /** Persona body length limit (characters) for promptMode="code" (default 6000). */
+  maxCharsCode?: number;
+  /**
+   * Length of the existing persona body as the generator measures it (after
+   * stripSceneNavigation and escapeXmlTags). Defaults to existingPersona.length.
+   * Above the active limit the user prompt asks for a full compressing rewrite.
+   */
+  existingPersonaChars?: number;
 }
 
 export interface PersonaPromptResult {
@@ -30,11 +40,26 @@ export interface PersonaPromptResult {
   userPrompt: string;
 }
 
+/** Default persona body limits in characters, one per prompt mode. */
+export const DEFAULT_PERSONA_MAX_CHARS_CHAT = 6_000;
+export const DEFAULT_PERSONA_MAX_CHARS_CODE = 6_000;
+
+/** Persona body length limit (characters) of the given prompt mode. */
+export function personaMaxCharsFor(
+  promptMode: MemoryPromptMode | undefined,
+  limits: { maxCharsChat?: number; maxCharsCode?: number },
+): number {
+  return promptMode === "code"
+    ? limits.maxCharsCode ?? DEFAULT_PERSONA_MAX_CHARS_CODE
+    : limits.maxCharsChat ?? DEFAULT_PERSONA_MAX_CHARS_CHAT;
+}
+
 // ============================
 // System Prompt (stable: role + constraints + logic + template)
+// Only the length-limit phrase is a parameter; every other character is fixed.
 // ============================
 
-const PERSONA_SYSTEM_PROMPT = `# 🧬 Persona Architect - Incremental Evolution Protocol
+const personaSystemPrompt = (maxCharsChat: number) => `# 🧬 Persona Architect - Incremental Evolution Protocol
 
 **输出语言**：\`persona.md\` 的所有自然语言内容（Archetype、基本信息、Chapter 1-4 正文等）使用与变化场景内容相同的语言；Markdown 语法、标签格式、文件名 \`persona.md\` 保持英文。模板里 Chapter 标识保留作骨架，非中文输出时请改用目标语言的对照说明。
 
@@ -50,7 +75,7 @@ const PERSONA_SYSTEM_PROMPT = `# 🧬 Persona Architect - Incremental Evolution 
 4. **无需 read 工具**：当前 persona.md 的完整内容已在用户消息中提供，直接基于它进行更新即可。
 
 ### 🚫 严格禁止
-- **禁止过长**：persona.md 内容总长度不要超过 2000 字符，及时做总结和删除不重要的信息。
+- **禁止过长**：persona.md 内容总长度不要超过 ${maxCharsChat} 字符，及时做总结和删除不重要的信息。
 - **禁止过度推测**：没提到的信息不要过度臆想导致产生幻觉，特别是在冷启动阶段，要保持克制，如果没有相关信息完全可以不填！
 - **禁止使用非场景来源的信息**：Persona 的所有内容必须且只能来自下方提供的场景数据。不要从 workspace 目录结构、文件路径、系统信息等技术元数据中提取任何关于用户的个人信息。
 - **禁止操作 persona.md 以外的任何文件**。
@@ -141,7 +166,7 @@ const PERSONA_SYSTEM_PROMPT = `# 🧬 Persona Architect - Incremental Evolution 
 - ✅ 不要添加场景导航（工程会自动追加）
 - ✅ 只操作 persona.md，不要操作其他文件`;
 
-const TEAM_MEMORY_SYSTEM_PROMPT = `# Team Operating Doctrine Architect
+const teamMemorySystemPrompt = (maxCharsCode: number) => `# Team Operating Doctrine Architect
 
 **输出语言**：\`persona.md\` 的所有自然语言内容使用与变化场景内容相同的语言；Markdown 语法、标签格式、文件名 \`persona.md\` 保持英文。
 
@@ -160,7 +185,7 @@ const TEAM_MEMORY_SYSTEM_PROMPT = `# Team Operating Doctrine Architect
 
 ## 🚫 严格禁止
 
-- **禁止超过 1200 字**：最终 \`persona.md\` 必须高度压缩，求精不求多。
+- **禁止超过 ${maxCharsCode} 字符**：最终 \`persona.md\` 必须高度压缩，求精不求多。
 - **禁止项目化碎片**：不要写只有在某个项目上下文里才懂的内容，例如"项目 v2 要优化"、"某模块继续推进"。
 - **禁止流水账**：不要记录发生了什么、谁做了什么、某任务进展如何，除非它已经抽象成通用方法。
 - **禁止低层事实堆积**：项目名、版本号、任务名、PR、Issue、文档名通常不要进入 L3，除非它们代表可复用范式。
@@ -215,7 +240,7 @@ const TEAM_MEMORY_SYSTEM_PROMPT = `# Team Operating Doctrine Architect
 
 ## 输出模板
 
-请参考以下格式，使用 **write** 或 **edit** 工具写入最终内容。可以删减章节，但必须保持 Markdown 格式，全文不超过 1200 字。
+请参考以下格式，使用 **write** 或 **edit** 工具写入最终内容。可以删减章节，但必须保持 Markdown 格式，全文不超过 ${maxCharsCode} 字符。
 
 # Team Operating Doctrine
 
@@ -255,7 +280,7 @@ const TEAM_MEMORY_SYSTEM_PROMPT = `# Team Operating Doctrine Architect
 ## 成功标准
 
 - ✅ 必须使用 write 或 edit 写入 \`persona.md\`
-- ✅ 最终内容不超过 1200 字
+- ✅ 最终内容不超过 ${maxCharsCode} 字符
 - ✅ 只保留所有工作场合可复用的原则、SOP、禁忌、判断逻辑和 Agent 规则
 - ✅ 每条内容脱离具体项目后仍语义完整
 - ✅ 求精不求多，能不写就不写，能合并就合并
@@ -281,6 +306,9 @@ export function buildPersonaPrompt(params: PersonaPromptParams): PersonaPromptRe
   } = params;
 
   const isCodeMode = promptMode === "code";
+  const maxCharsChat = params.maxCharsChat ?? DEFAULT_PERSONA_MAX_CHARS_CHAT;
+  const maxCharsCode = params.maxCharsCode ?? DEFAULT_PERSONA_MAX_CHARS_CODE;
+  const maxChars = isCodeMode ? maxCharsCode : maxCharsChat;
   const targetFile = "persona.md";
   const modeLabel = mode === "first" ? "🆕 首次生成" : "🔄 迭代更新";
 
@@ -291,11 +319,21 @@ export function buildPersonaPrompt(params: PersonaPromptParams): PersonaPromptRe
   const existingPersonaSection = existingPersona
     ? isCodeMode
       ? `\n## 📄 当前 Team Operating Doctrine（工程已预加载）\n\n` +
-        `*以下是现有 persona.md 中 Team Operating Doctrine 的完整内容（${existingPersona.length} 字符）。更新后必须压缩在 1200 字以内：*\n\n` +
+        `*以下是现有 persona.md 中 Team Operating Doctrine 的完整内容（${existingPersona.length} 字符）。更新后必须压缩在 ${maxCharsCode} 字符以内：*\n\n` +
         `\`\`\`markdown\n${existingPersona}\n\`\`\`\n\n---\n`
       : `\n## 📄 当前 Persona（工程已预加载）\n\n` +
-        `*以下是现有 persona.md 的完整内容（${existingPersona.length} 字符），基于此更新后请控制在2000字内：*\n\n` +
+        `*以下是现有 persona.md 的完整内容（${existingPersona.length} 字符），基于此更新后请控制在${maxCharsChat} 字符内：*\n\n` +
         `\`\`\`markdown\n${existingPersona}\n\`\`\`\n\n---\n`
+    : "";
+
+  // Compress mode: the existing body is already over the active limit, so
+  // ask for a full rewrite with `write` instead of piling edits on top.
+  const existingChars = existingPersona ? params.existingPersonaChars ?? existingPersona.length : 0;
+  const compressSection = existingPersona && existingChars > maxChars
+    ? `\n## ⚠️ 长度超限：必须整体重写并压缩\n\n` +
+      `当前 persona.md 正文长度为 ${existingChars} 字符，已超过上限 ${maxChars} 字符。` +
+      `本次必须使用 **write** 工具整体重写 persona.md（不要用 edit 局部修改），` +
+      `合并重复内容、删除不重要的信息，把正文压缩到 ${maxChars} 字符以内。\n`
     : "";
 
   const iterationGuide = mode === "incremental"
@@ -320,10 +358,10 @@ ${triggerSection}
 ${changedScenesContent}
 
 ${existingPersonaSection}
-${iterationGuide}`;
+${iterationGuide}${compressSection}`;
 
   return {
-    systemPrompt: isCodeMode ? TEAM_MEMORY_SYSTEM_PROMPT : PERSONA_SYSTEM_PROMPT,
+    systemPrompt: isCodeMode ? teamMemorySystemPrompt(maxCharsCode) : personaSystemPrompt(maxCharsChat),
     userPrompt,
   };
 }

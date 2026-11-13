@@ -42,6 +42,17 @@ export interface HealthResponse {
     /** LLM calls of every StandaloneLLMRunner of the process (L1, dedup, L2, L3, skill). */
     llm: ProviderHealthSnapshot;
   };
+  /**
+   * L3 persona generations of the process since start (additive field):
+   * generations that called the LLM, write nudges sent, nudges that led to a
+   * written and successful generation, and generations over the length limit.
+   */
+  persona: {
+    personaGenerations: number;
+    personaWriteNudges: number;
+    personaWriteNudgeSuccesses: number;
+    personaOverLimit: number;
+  };
   /** Integrated services status (only present when state_backend is configured) */
   services?: {
     timerScanner: unknown;

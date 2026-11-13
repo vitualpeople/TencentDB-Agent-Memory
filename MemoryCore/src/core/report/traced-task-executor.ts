@@ -43,23 +43,25 @@ export class TracedTaskExecutor implements TaskExecutor {
     this.inner = inner;
   }
 
-  async executeL1(task: TaskPayload): Promise<void> {
-    return this.executeWithTrace("L1", task, () => this.inner.executeL1(task));
+  // The worker's abort signal (lost lock, shutdown) is passed through to the
+  // inner executor so it reaches the LLM calls of every layer.
+  async executeL1(task: TaskPayload, signal?: AbortSignal): Promise<void> {
+    return this.executeWithTrace("L1", task, () => this.inner.executeL1(task, signal));
   }
 
-  async executeL2(task: TaskPayload): Promise<void> {
-    return this.executeWithTrace("L2", task, () => this.inner.executeL2(task));
+  async executeL2(task: TaskPayload, signal?: AbortSignal): Promise<void> {
+    return this.executeWithTrace("L2", task, () => this.inner.executeL2(task, signal));
   }
 
-  async executeL3(task: TaskPayload): Promise<void> {
-    return this.executeWithTrace("L3", task, () => this.inner.executeL3(task));
+  async executeL3(task: TaskPayload, signal?: AbortSignal): Promise<void> {
+    return this.executeWithTrace("L3", task, () => this.inner.executeL3(task, signal));
   }
 
-  async executeFlush?(task: TaskPayload): Promise<void> {
+  async executeFlush?(task: TaskPayload, signal?: AbortSignal): Promise<void> {
     if (this.inner.executeFlush) {
-      return this.executeWithTrace("flush", task, () => this.inner.executeFlush!(task));
+      return this.executeWithTrace("flush", task, () => this.inner.executeFlush!(task, signal));
     }
-    return this.executeL1(task);
+    return this.executeL1(task, signal);
   }
 
   async executeOffloadL1?(task: TaskPayload, signal?: AbortSignal): Promise<void> {

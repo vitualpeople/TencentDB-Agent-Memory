@@ -27,7 +27,7 @@ interface Logger {
  * Returns the full storage key (prefix + normalized path), or null if the
  * path escapes the prefix boundary (e.g. "../" traversal).
  */
-function resolveStorageKey(prefix: string, relativePath: string): string | null {
+export function resolveStorageKey(prefix: string, relativePath: string): string | null {
   // Normalize: strip leading ./ , convert backslashes, collapse //
   const normalized = relativePath
     .replace(/\\/g, "/")

@@ -5,8 +5,8 @@
  *
  *   L18 the persona LLM fails: generateLocalPersona returns "failed", the L3
  *       runner throws "Persona generation failed", and through the worker
- *       the task takes the L13 path (3 retries, then an in-process dead
- *       letter). The persona checkpoint is not advanced.
+ *       the L3 task gets its own retry budget (1 retry, then an in-process
+ *       dead letter; L1/L2 keep 3). The persona checkpoint is not advanced.
  *   L19 the LLM rewrites persona.md with the same body: "unchanged", and the
  *       runner still calls markPersonaGenerated (counter reset, time set);
  *       persona.md is rewritten with a fresh scene navigation appended.
@@ -53,7 +53,7 @@ function l3For(dir: string, run: (p: { workspaceDir?: string }) => Promise<strin
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
 describe("L18 L3 persona LLM failure", () => {
-  it("L18 the runner throws \"Persona generation failed\" with a 180 s LLM call, and the persona checkpoint stays put", async () => {
+  it("L18 the runner throws \"Persona generation failed\" after one LLM call bounded by the 180 s generation deadline, and the persona checkpoint stays put", async () => {
     vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
     const dir = await fixture(true);
     const calls: Array<Record<string, unknown>> = [];
@@ -61,15 +61,18 @@ describe("L18 L3 persona LLM failure", () => {
 
     await expect(l3()).rejects.toThrow("[L3] Persona generation failed (scope=global)");
 
+    // A provider error is not nudged: one call, whose timeout is what is left of the deadline.
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ taskId: "persona-generation", timeoutMs: 180_000, workspaceDir: dir });
+    expect(calls[0]).toMatchObject({ taskId: "persona-generation", workspaceDir: dir });
+    expect(calls[0].timeoutMs as number).toBeLessThanOrEqual(180_000);
+    expect(calls[0].timeoutMs as number).toBeGreaterThan(170_000);
     const cp = await new CheckpointManager(dir, silent).read();
     expect(cp.last_persona_time).toBe("");
     expect(cp.memories_since_last_persona).toBe(4);
     expect(fs.readFileSync(path.join(dir, "persona.md"), "utf-8")).toBe(PERSONA);
   });
 
-  it("L18 through the worker the L3 task is run 1 + 3 times (5 s, 15 s, 45 s) and then dead-lettered", async () => {
+  it("L18 through the worker the L3 task is run 1 + 1 times (5 s backoff) and then dead-lettered", async () => {
     vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
     const dir = await fixture(true);
     let llmCalls = 0;
@@ -85,8 +88,8 @@ describe("L18 L3 persona LLM failure", () => {
 
       await vi.waitFor(() => { expect(worker.getMetrics().tasksDeadLettered).toBe(1); }, { timeout: 10_000, interval: 10 });
 
-      expect(llmCalls).toBe(4);
-      expect(worker.getMetrics()).toMatchObject({ tasksRetried: 3, tasksFailed: 4 });
+      expect(llmCalls).toBe(2);
+      expect(worker.getMetrics()).toMatchObject({ tasksRetried: 1, tasksFailed: 2 });
       expect(worker.getDeadLetterQueue()[0].error).toContain("Persona generation failed");
     } finally {
       await worker.stop();
@@ -121,12 +124,15 @@ describe("L19 L3 output unchanged", () => {
     expect(written).toContain("Scene Navigation");
   });
 
-  it("L19 control: an LLM that does not touch persona.md is \"failed\" (not unchanged) and the checkpoint is not marked", async () => {
+  it("L19 control: an LLM that does not touch persona.md, even after the write nudge, is \"failed\" (not unchanged) after 2 calls and the checkpoint is not marked", async () => {
     vi.stubEnv("TDAI_PERSONA_TRIGGER_MODE", undefined);
     const dir = await fixture(true);
-    const l3 = l3For(dir, async () => "I decided nothing needs to change");
+    let llmCalls = 0;
+    const l3 = l3For(dir, async () => { llmCalls++; return "I decided nothing needs to change"; });
 
     await expect(l3()).rejects.toThrow("Persona generation failed");
+
+    expect(llmCalls).toBe(2);
 
     const cp = await new CheckpointManager(dir, silent).read();
     expect(cp.memories_since_last_persona).toBe(4);

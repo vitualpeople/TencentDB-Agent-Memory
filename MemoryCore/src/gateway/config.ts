@@ -68,6 +68,12 @@ export interface WorkerConfig {
    * DEFAULT_DEAD_LETTER_RETRY_DELAY_MS in services/pipeline-worker.ts.
    */
   deadLetterRetryDelayMs: number;
+  /**
+   * Retries of an L3 (persona) task (default 1; L1/L2 keep 3). Integer 0..10.
+   * Env TDAI_WORKER_L3_MAX_RETRIES (or WORKER_L3_MAX_RETRIES) wins over YAML
+   * `worker.l3MaxRetries`.
+   */
+  l3MaxRetries: number;
 }
 
 export interface CosExtraConfig {
@@ -598,6 +604,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     pollMs: envInt("WORKER_POLL_MS") ?? num(workerConfig, "pollMs") ?? 200,
     concurrency: envInt("WORKER_CONCURRENCY") ?? num(workerConfig, "concurrency") ?? 60,
     deadLetterRetryDelayMs: envInt("WORKER_DEAD_LETTER_RETRY_DELAY_MS") ?? num(workerConfig, "deadLetterRetryDelayMs") ?? 900_000,
+    l3MaxRetries: resolveL3MaxRetries(workerConfig),
   };
 
   // COS extra config
@@ -822,6 +829,36 @@ function resolveDefaultDataDir(): string {
 function env(key: string): string | undefined {
   const v = getEnv(key)?.trim();
   return v || undefined;
+}
+
+/**
+ * L3 retry budget. The raw env string is checked before any parseInt, so a
+ * value such as "2x" or "abc" fails startup instead of silently becoming the
+ * default (envInt would turn it into undefined).
+ */
+function resolveL3MaxRetries(workerConfig: Record<string, unknown>): number {
+  const envName = env("TDAI_WORKER_L3_MAX_RETRIES") !== undefined
+    ? "TDAI_WORKER_L3_MAX_RETRIES"
+    : "WORKER_L3_MAX_RETRIES";
+  const raw = env(envName);
+  let value: number;
+  if (raw !== undefined) {
+    if (!/^-?[0-9]+$/.test(raw)) {
+      throw new Error(`${envName} must be an integer between 0 and 10, got "${raw}"`);
+    }
+    value = Number(raw);
+  } else if (workerConfig.l3MaxRetries !== undefined && workerConfig.l3MaxRetries !== null) {
+    if (typeof workerConfig.l3MaxRetries !== "number") {
+      throw new Error(`worker.l3MaxRetries must be an integer between 0 and 10, got ${JSON.stringify(workerConfig.l3MaxRetries)}`);
+    }
+    value = workerConfig.l3MaxRetries;
+  } else {
+    return 1;
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 10) {
+    throw new Error(`worker.l3MaxRetries must be an integer between 0 and 10, got ${value}`);
+  }
+  return value;
 }
 
 function envInt(key: string): number | undefined {
