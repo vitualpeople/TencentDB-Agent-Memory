@@ -11,6 +11,7 @@
 
 import { tool, jsonSchema } from "ai";
 import type { StorageAdapter } from "../../core/storage/adapter.js";
+import { assertWriteAllowed, type CheckpointWriteGuard } from "../../utils/checkpoint.js";
 
 const TAG = "[memory-tdai] [storage-tools]";
 
@@ -52,11 +53,15 @@ export function resolveStorageKey(prefix: string, relativePath: string): string 
  * @param storage    - StorageAdapter instance (COS or local backend)
  * @param prefix     - Key prefix acting as sandbox root (e.g. "scene_blocks/")
  * @param logger     - Optional logger for diagnostics
+ * @param guard      - Optional write guard (L3 persona): re-checked right before
+ *                     each storage write, so a write never starts after the
+ *                     caller's abort or deadline, including after edit's read
  */
 export function createStorageTools(
   storage: StorageAdapter,
   prefix: string,
   logger?: Logger,
+  guard?: CheckpointWriteGuard,
 ) {
   return {
     read: tool({
@@ -101,6 +106,7 @@ export function createStorageTools(
         const key = resolveStorageKey(prefix, args.path);
         if (!key) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
         try {
+          assertWriteAllowed(guard);
           await storage.writeFile(key, args.content);
           logger?.debug?.(`${TAG} write: "${args.path}" → ${args.content.length} chars`);
           return JSON.stringify({ success: true });
@@ -151,6 +157,7 @@ export function createStorageTools(
             }
             content = content.replace(edit.oldText, edit.newText);
           }
+          assertWriteAllowed(guard);
           await storage.writeFile(key, content);
           logger?.debug?.(`${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${content.length} chars`);
           return JSON.stringify({ success: true });

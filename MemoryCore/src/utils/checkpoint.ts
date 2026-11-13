@@ -201,7 +201,12 @@ export class CheckpointWriteRejectedError extends Error {
   }
 }
 
-function assertWriteAllowed(guard: CheckpointWriteGuard | undefined): void {
+/**
+ * Throw CheckpointWriteRejectedError when the guard's signal is aborted or its
+ * deadline has passed; no-op without a guard. Also used right before other
+ * L3 writes (persona tools, provenance) so none of them starts late.
+ */
+export function assertWriteAllowed(guard: CheckpointWriteGuard | undefined): void {
   if (!guard) return;
   if (guard.signal?.aborted) throw new CheckpointWriteRejectedError("aborted");
   if (guard.deadlineAt !== undefined && Date.now() >= guard.deadlineAt) {

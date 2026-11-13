@@ -8,7 +8,7 @@
 
 import type { MemoryPromptMode } from "../../config.js";
 
-export interface PersonaPromptParams {
+interface PersonaPromptBaseParams {
   mode: "first" | "incremental";
   /** Prompt family for L3 generation (default: chat). */
   promptMode?: MemoryPromptMode;
@@ -17,7 +17,6 @@ export interface PersonaPromptParams {
   sceneCount: number;
   changedSceneCount: number;
   changedScenesContent: string;
-  existingPersona?: string;
   triggerInfo?: string;
   /** @deprecated Kept for call-site compatibility; no longer used in prompt. */
   personaFilePath: string;
@@ -27,13 +26,20 @@ export interface PersonaPromptParams {
   maxCharsChat?: number;
   /** Persona body length limit (characters) for promptMode="code" (default 6000). */
   maxCharsCode?: number;
-  /**
-   * Length of the existing persona body as the generator measures it (after
-   * stripSceneNavigation and escapeXmlTags). Defaults to existingPersona.length.
-   * Above the active limit the user prompt asks for a full compressing rewrite.
-   */
-  existingPersonaChars?: number;
 }
+
+/**
+ * `existingPersona` (the body, navigation stripped, embedded raw in the
+ * prompt) always comes with `existingPersonaChars`: its length as the
+ * generator measures every persona body,
+ * escapeXmlTags(stripSceneNavigation(x).trim()).length. That one number is
+ * printed in every length line of the user prompt and decides the
+ * compressing-rewrite instruction (above the active limit).
+ */
+export type PersonaPromptParams = PersonaPromptBaseParams & (
+  | { existingPersona?: undefined; existingPersonaChars?: undefined }
+  | { existingPersona: string; existingPersonaChars: number }
+);
 
 export interface PersonaPromptResult {
   systemPrompt: string;
@@ -316,19 +322,23 @@ export function buildPersonaPrompt(params: PersonaPromptParams): PersonaPromptRe
     ? `\n### 触发信息\n${triggerInfo}\n`
     : "";
 
+  if (existingPersona !== undefined && !Number.isInteger(params.existingPersonaChars)) {
+    throw new Error("buildPersonaPrompt: existingPersonaChars (escaped body length) is required with existingPersona");
+  }
+  const existingChars = existingPersona !== undefined ? params.existingPersonaChars! : 0;
+
   const existingPersonaSection = existingPersona
     ? isCodeMode
       ? `\n## 📄 当前 Team Operating Doctrine（工程已预加载）\n\n` +
-        `*以下是现有 persona.md 中 Team Operating Doctrine 的完整内容（${existingPersona.length} 字符）。更新后必须压缩在 ${maxCharsCode} 字符以内：*\n\n` +
+        `*以下是现有 persona.md 中 Team Operating Doctrine 的完整内容（${existingChars} 字符）。更新后必须压缩在 ${maxCharsCode} 字符以内：*\n\n` +
         `\`\`\`markdown\n${existingPersona}\n\`\`\`\n\n---\n`
       : `\n## 📄 当前 Persona（工程已预加载）\n\n` +
-        `*以下是现有 persona.md 的完整内容（${existingPersona.length} 字符），基于此更新后请控制在${maxCharsChat} 字符内：*\n\n` +
+        `*以下是现有 persona.md 的完整内容（${existingChars} 字符），基于此更新后请控制在${maxCharsChat} 字符内：*\n\n` +
         `\`\`\`markdown\n${existingPersona}\n\`\`\`\n\n---\n`
     : "";
 
   // Compress mode: the existing body is already over the active limit, so
   // ask for a full rewrite with `write` instead of piling edits on top.
-  const existingChars = existingPersona ? params.existingPersonaChars ?? existingPersona.length : 0;
   const compressSection = existingPersona && existingChars > maxChars
     ? `\n## ⚠️ 长度超限：必须整体重写并压缩\n\n` +
       `当前 persona.md 正文长度为 ${existingChars} 字符，已超过上限 ${maxChars} 字符。` +

@@ -193,12 +193,16 @@ describe("Case F2 gateway: L3 retry setting and persona env pass-through", () =>
     expect(() => loadGatewayConfig()).toThrow("worker.l3MaxRetries");
   });
 
-  it("F2 the three TDAI_PERSONA_* variables reach cfg.memory.persona through loadGatewayConfig", () => {
+  it("F2 the five TDAI_PERSONA_* variables reach cfg.memory.persona through loadGatewayConfig", () => {
     gatewayConfigFile();
     vi.stubEnv("TDAI_PERSONA_TIMEOUT_MS", "7000");
     vi.stubEnv("TDAI_PERSONA_MAX_CHARS_CHAT", "3000");
     vi.stubEnv("TDAI_PERSONA_MAX_CHARS_CODE", "2500");
-    expect(loadGatewayConfig().memory.persona).toMatchObject({ timeoutMs: 7_000, maxCharsChat: 3_000, maxCharsCode: 2_500 });
+    vi.stubEnv("TDAI_PERSONA_MIN_RUNNER_MS", "3000");
+    vi.stubEnv("TDAI_PERSONA_MIN_NUDGE_MS", "2000");
+    expect(loadGatewayConfig().memory.persona).toMatchObject({
+      timeoutMs: 7_000, maxCharsChat: 3_000, maxCharsCode: 2_500, minRunnerMs: 3_000, minNudgeMs: 2_000,
+    });
   });
 });
 
