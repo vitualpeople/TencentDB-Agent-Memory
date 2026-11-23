@@ -10,6 +10,7 @@
  */
 import type { TaskPayload } from "../core/state/types.js";
 import { InMemoryQuotaDeferralStore, type QuotaDeferralEntry, type QuotaDeferralStore } from "./quota-deferral-store.js";
+import { extractSessionForFilter, type SessionFilter } from "../utils/session-filter.js";
 
 interface Logger {
   info: (message: string) => void;
@@ -37,11 +38,18 @@ export class QuotaDeferralScheduler {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopped = false;
 
+  /**
+   * @param sessionFilter - sessions excluded from the pipeline
+   *   (memory.capture.excludeAgents): their stored deferrals are removed at
+   *   start instead of re-armed, so work deferred before the filter existed
+   *   never runs.
+   */
   constructor(
     private readonly delayMs: number,
     private readonly enqueue: (task: TaskPayload) => Promise<void>,
     private readonly logger: Logger,
     store?: QuotaDeferralStore,
+    private readonly sessionFilter?: Pick<SessionFilter, "shouldSkip">,
   ) {
     this.store = store ?? new InMemoryQuotaDeferralStore();
   }
@@ -56,11 +64,22 @@ export class QuotaDeferralScheduler {
       this.logger.warn(`${TAG} Failed to load deferred tasks: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    let restored = 0;
     for (const entry of entries) {
+      if (this.sessionFilter?.shouldSkip(extractSessionForFilter(entry.task.sessionId))) {
+        try {
+          await this.store.remove(entry.id);
+          this.logger.info(`${TAG} Dropped deferred ${entry.task.type} ${entry.id} [${entry.task.sessionId}]: session excluded by memory.capture.excludeAgents`);
+        } catch (err) {
+          this.logger.warn(`${TAG} Failed to remove excluded deferred task ${entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        continue;
+      }
       this.byKey.set(entry.key, entry);
       this.arm(entry);
+      restored++;
     }
-    if (entries.length > 0) this.logger.info(`${TAG} Restored ${entries.length} quota-deferred task(s)`);
+    if (restored > 0) this.logger.info(`${TAG} Restored ${restored} quota-deferred task(s)`);
   }
 
   stop(): void {

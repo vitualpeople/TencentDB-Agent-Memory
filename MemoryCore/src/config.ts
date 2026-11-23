@@ -13,7 +13,7 @@
 
 /** Prompt family for L1-L3 memory pipeline. */
 export type MemoryPromptMode = "chat" | "code";
-export type PersonaTriggerMode = "current" | "jev";
+export type PersonaTriggerMode = "current" | "jev" | "off";
 export type JevDiagnosticsMode = "off" | "metadata" | "full";
 
 /**
@@ -83,7 +83,11 @@ export interface PersonaConfig {
   model?: string;
   /** Prompt family for L2/L3 prompts (default: chat; code prompts will be wired as they are added). */
   promptMode: MemoryPromptMode;
-  /** Existing trigger policy, optionally augmented by the JEV immediate-update gate. */
+  /**
+   * Existing trigger policy, optionally augmented by the JEV immediate-update
+   * gate. "off" runs no L3 at all: no L3 task after L2, a leftover L3 task is
+   * a no-op, and no Jev key is required (env TDAI_PERSONA_TRIGGER_MODE).
+   */
   triggerMode: PersonaTriggerMode;
   /** Direct System One client configuration used only when triggerMode="jev". */
   jev: PersonaJevConfig;
@@ -499,10 +503,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const jevGroup = obj(personaGroup, "jev");
   const jevDiagnosticsGroup = obj(jevGroup, "diagnostics");
   const rawTriggerMode = process.env.TDAI_PERSONA_TRIGGER_MODE?.trim() || str(personaGroup, "triggerMode");
-  if (rawTriggerMode && rawTriggerMode !== "current" && rawTriggerMode !== "jev") {
-    throw new Error(`memory.persona.triggerMode must be "current" or "jev", got "${rawTriggerMode}"`);
+  if (rawTriggerMode && rawTriggerMode !== "current" && rawTriggerMode !== "jev" && rawTriggerMode !== "off") {
+    throw new Error(`memory.persona.triggerMode must be "current", "jev" or "off", got "${rawTriggerMode}"`);
   }
-  const triggerMode: PersonaTriggerMode = rawTriggerMode === "jev" ? "jev" : "current";
+  const triggerMode: PersonaTriggerMode = rawTriggerMode === "jev" || rawTriggerMode === "off" ? rawTriggerMode : "current";
   const rawDiagnosticsMode = str(jevDiagnosticsGroup, "mode");
   if (rawDiagnosticsMode && !["off", "metadata", "full"].includes(rawDiagnosticsMode)) {
     throw new Error(

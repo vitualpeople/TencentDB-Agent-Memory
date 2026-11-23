@@ -773,6 +773,7 @@ export class TdaiCore {
 
     // L3 runner
     this.scheduler.setL3Runner(async () => {
+      if (this.cfg.persona.triggerMode === "off") return; // persona generation disabled
       const l3Runner = createL3Runner({
         pluginDataDir: this.dataDir,
         cfg: this.cfg,
@@ -1191,6 +1192,12 @@ export class TdaiCore {
     executionContext?: L3JevExecutionContext,
     checkpointLock?: import("../utils/checkpoint.js").CheckpointLockOptions,
   ): Promise<{ creditUsed: number }> {
+    // persona.triggerMode "off": an L3 task left from before (queue or quota
+    // deferral) ends here, with no LLM and no Jev request.
+    if (this.cfg.persona.triggerMode === "off") {
+      this.logger.debug?.(`${TAG} [L3] persona.triggerMode=off, L3 skipped (task=${executionContext?.l3TaskId ?? "?"})`);
+      return { creditUsed: 0 };
+    }
     const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
