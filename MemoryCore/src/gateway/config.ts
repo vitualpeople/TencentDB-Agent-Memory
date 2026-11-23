@@ -69,6 +69,13 @@ export interface WorkerConfig {
    */
   deadLetterRetryDelayMs: number;
   /**
+   * Wait before an L1/L2/L3 task that failed on an LLM quota or rate limit
+   * runs again (default: 900000 = 15 min). Env WORKER_LLM_QUOTA_DEFER_MS wins
+   * over YAML `worker.quotaDeferDelayMs`. See DEFAULT_QUOTA_DEFER_DELAY_MS in
+   * services/quota-deferral-scheduler.ts.
+   */
+  quotaDeferDelayMs: number;
+  /**
    * Retries of an L3 (persona) task (default 1; L1/L2 keep 3). Integer 0..10.
    * Env TDAI_WORKER_L3_MAX_RETRIES (or WORKER_L3_MAX_RETRIES) wins over YAML
    * `worker.l3MaxRetries`.
@@ -604,6 +611,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     pollMs: envInt("WORKER_POLL_MS") ?? num(workerConfig, "pollMs") ?? 200,
     concurrency: envInt("WORKER_CONCURRENCY") ?? num(workerConfig, "concurrency") ?? 60,
     deadLetterRetryDelayMs: envInt("WORKER_DEAD_LETTER_RETRY_DELAY_MS") ?? num(workerConfig, "deadLetterRetryDelayMs") ?? 900_000,
+    quotaDeferDelayMs: envInt("WORKER_LLM_QUOTA_DEFER_MS") ?? num(workerConfig, "quotaDeferDelayMs") ?? 900_000,
     l3MaxRetries: resolveL3MaxRetries(workerConfig),
   };
 

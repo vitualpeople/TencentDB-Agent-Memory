@@ -1857,6 +1857,7 @@ export class TdaiGateway {
 
     // 3. Start Pipeline Worker
     const { PipelineWorker } = await import("../services/pipeline-worker.js");
+    const { FileQuotaDeferralStore } = await import("../services/quota-deferral-store.js");
     const rawExecutor = this.buildTaskExecutor();
     // 用 TracedTaskExecutor 装饰器包装，为 L1/L2/L3 任务添加 Trace Span
     const executor = new TracedTaskExecutor(rawExecutor);
@@ -1867,6 +1868,14 @@ export class TdaiGateway {
       deadLetterRetryDelayMs: this.config.worker.deadLetterRetryDelayMs,
       // L3 retries apart from L1/L2: one L3 attempt already includes the write nudge
       l3MaxRetries: this.config.worker.l3MaxRetries,
+      // LLM quota / rate limit: re-run later instead of retrying into the dead letter.
+      quotaDeferDelayMs: this.config.worker.quotaDeferDelayMs,
+      // The local backend's queue and timers live in RAM: keep deferred tasks
+      // on disk so a restart re-arms them. A remote backend keeps its queue,
+      // so a file copy there could replay a task twice; it stays in RAM.
+      quotaDeferralStore: backendType === "local"
+        ? new FileQuotaDeferralStore(join(this.config.data.baseDir, "metadata", "pipeline-quota-deferrals.json"))
+        : undefined,
       // L1 完成后推进 L2 timer（快路径：L1完成 → delay秒后触发L2）
       onL1Complete: statefulManager.advanceL2TimerAfterL1.bind(statefulManager),
       // L2 完成后设置 maxInterval 兜底 timer

@@ -20,6 +20,7 @@ import type { L2Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
 import { L1ExtractionError } from "../core/record/l1-extraction-error.js";
+import { LlmQuotaError, isLlmQuotaError, watchLlmQuota } from "./llm-quota-error.js";
 import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
 import type { ConversationMessage } from "../core/conversation/l0-recorder.js";
 import { CheckpointManager } from "./checkpoint.js";
@@ -774,11 +775,14 @@ export function createL1Runner(opts: {
           `${TAG} [l1] ${failedGroups.length}/${groups.length} group(s) failed (kind=${kind}); ` +
           `cursor stops at ${stopAt}, ${done.size} done id(s) kept, stored=${totalStored}`,
         );
-        throw new L1ExtractionError(kind,`L1 failed for ${failedGroups.length} group(s): ${first.message}`, {
+        // A quota failure of any group is the cause PipelineWorker sees, so
+        // the slice is deferred rather than retried into the dead letter.
+        const cause = failedGroups.find((f) => isLlmQuotaError(f.err))?.err ?? first;
+        throw new L1ExtractionError(kind,`L1 failed for ${failedGroups.length} group(s): ${cause.message}`, {
           frozenMessageIds: failedGroups.flatMap((f) => f.group.messages.map((m) => m.id).filter((id): id is string => typeof id === "string")),
           upperBoundMs: maxRecordedAtMs,
           completedProfileScopes: Array.from(profileScopes),
-          cause: first,
+          cause,
         });
       }
 
@@ -922,6 +926,9 @@ export function createL2Runner(opts: {
       grouped.set(key, list);
     }
 
+    // The scene extractor turns an LLM error into success:false; the watch
+    // lets this run tell a quota failure apart and throw it (see below).
+    const quotaWatch = llmRunner ? watchLlmQuota(llmRunner) : undefined;
     let processedTotal = 0;
     let anyEmptyExtraction = false;
     const l2PromptTargets = [...grouped.values()].map((groupRecords) => ({
@@ -954,7 +961,7 @@ export function createL2Runner(opts: {
         sceneBackupCount: cfg.persona.sceneBackupCount,
         logger,
         instanceId,
-        llmRunner,
+        llmRunner: quotaWatch?.runner ?? llmRunner,
         storage: groupStorage,
         // langfuse: 透传身份四元组，UI 上可按 user/session 列过滤
         traceContext: { teamId: ctx.teamId, userId: ctx.userId, agentId: ctx.agentId, sessionId: ctx.sessionId },
@@ -978,6 +985,12 @@ export function createL2Runner(opts: {
         layer: "l2",
       }));
       const extractResult = await extractor.extract(memories);
+      // A quota failure stops the run with a typed error, so PipelineWorker
+      // defers the task (no cursor move, no L3, no dead letter); the other
+      // groups would hit the same limit.
+      if (!extractResult.success && quotaWatch?.quotaError()) {
+        throw new LlmQuotaError(quotaWatch.quotaError(), `L2 scene extraction, session=${sessionKey}`);
+      }
       if (!(extractResult.success && extractResult.memoriesProcessed > 0)) continue;
       if (extractResult.emptyExtraction) {
         anyEmptyExtraction = true;
@@ -1364,6 +1377,9 @@ export function createL3Runner(opts: {
         const personaTools = createPersonaWriteTools({
           workspaceDir: scopedDir, storage: scopedStore, logger, guard: checkpointGuard,
         });
+        // The generator turns an LLM error into outcome "failed"; the watch
+        // lets this scope tell a quota failure apart and throw it typed.
+        const quotaWatch = llmRunner ? watchLlmQuota(llmRunner) : undefined;
         const generator = new PersonaGenerator({
           dataDir: scopedDir,
           config: openclawConfig,
@@ -1373,7 +1389,7 @@ export function createL3Runner(opts: {
           backupCount: cfg.persona.backupCount,
           logger,
           instanceId,
-          llmRunner,
+          llmRunner: quotaWatch?.runner ?? llmRunner,
           storage: scopedStore,
           traceContext: scopeIsolation,
           tools: personaTools,
@@ -1408,6 +1424,11 @@ export function createL3Runner(opts: {
             personaAfterHash: await readPersonaBodyHash(scopedDir, scopedStore),
             scopeStartedAt, jevAddedLockMs,
           });
+          // Quota / rate limit: PipelineWorker defers the task instead of
+          // retrying it into the dead letter.
+          if (quotaWatch?.quotaError()) {
+            throw new LlmQuotaError(quotaWatch.quotaError(), `L3 persona generation, scope=${scope}`);
+          }
           throw new Error(`${TAG} [L3] Persona generation failed (scope=${scope})`);
         }
         if (genResult === "unchanged") {

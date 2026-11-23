@@ -31,6 +31,7 @@ import type {
 } from "../../core/types.js";
 import type { LLMUsage } from "../../core/report/metric-tracking-runner.js";
 import { assertWriteAllowed, type CheckpointWriteGuard } from "../../utils/checkpoint.js";
+import { describeLlmQuotaError, isLlmQuotaError } from "../../utils/llm-quota-error.js";
 
 const TAG = "[memory-tdai] [standalone-runner]";
 
@@ -416,9 +417,13 @@ export class StandaloneLLMRunner implements LLMRunner {
     } catch (err) {
       const totalMs = Date.now() - runStartMs;
       let errMsg = err instanceof Error ? err.message : String(err);
-      // Provider HTTP errors carry the status, url and response body; the bare
-      // message alone does not say which upstream call failed or why.
-      if (APICallError.isInstance(err)) {
+      if (isLlmQuotaError(err)) {
+        // Quota / rate limit: the worker defers the task. Log only the status
+        // and provider code, never the provider's message or body.
+        errMsg = `LLM quota or rate limit (${describeLlmQuotaError(err)}${APICallError.isInstance(err) ? `, url=${err.url}` : ""})`;
+      } else if (APICallError.isInstance(err)) {
+        // Provider HTTP errors carry the status, url and response body; the bare
+        // message alone does not say which upstream call failed or why.
         const body = typeof err.responseBody === "string" ? err.responseBody : "";
         const bodyPreview = body.slice(0, 2048);
         errMsg += ` (status=${err.statusCode ?? "?"}, url=${err.url}${bodyPreview ? `, body=${bodyPreview}${body.length > 2048 ? `...(+${body.length - 2048})` : ""}` : ""})`;

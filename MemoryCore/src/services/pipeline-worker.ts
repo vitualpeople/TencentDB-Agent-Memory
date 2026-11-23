@@ -19,6 +19,9 @@ import { serializeTraceContext } from "../core/report/trace-propagation.js";
 import { obsLogger } from "../core/report/obs-logger.js";
 import { buildPipelineTimerMember, L1_DEAD_LETTER_TIMER } from "../core/state/timer-member.js";
 import { isL1ExtractionError, type L1ExtractionError } from "../core/record/l1-extraction-error.js";
+import { describeLlmQuotaError, isLlmQuotaError } from "../utils/llm-quota-error.js";
+import { DEFAULT_QUOTA_DEFER_DELAY_MS, QuotaDeferralScheduler } from "./quota-deferral-scheduler.js";
+import type { QuotaDeferralStore } from "./quota-deferral-store.js";
 
 // ============================
 // Types
@@ -122,6 +125,22 @@ export interface PipelineWorkerConfig {
    * it (see moveToDeadLetter).
    */
   deadLetterRetryDelayMs?: number;
+
+  /**
+   * An L1/L2/L3 task whose LLM call failed on a quota or rate limit (HTTP 429
+   * or a MiniMax quota code, see utils/llm-quota-error.ts) is not retried
+   * toward the dead letter: it is ACKed and enqueued again this many ms later
+   * with its retry count unchanged. Default DEFAULT_QUOTA_DEFER_DELAY_MS
+   * (15 min).
+   */
+  quotaDeferDelayMs?: number;
+
+  /**
+   * Where quota-deferred tasks are kept until their re-run settles. The
+   * gateway passes a file store so a restart re-arms them; the default keeps
+   * them in RAM only.
+   */
+  quotaDeferralStore?: QuotaDeferralStore;
 }
 
 /**
@@ -236,7 +255,7 @@ export async function claimDeadLetterRetryL1Count(
 export class PipelineWorker {
   private backend: IStateBackend;
   private executor: TaskExecutor;
-  private config: Required<Omit<PipelineWorkerConfig, "onDeadLetter" | "onL1Complete" | "onL2Complete" | "permitPool">> & {
+  private config: Required<Omit<PipelineWorkerConfig, "onDeadLetter" | "onL1Complete" | "onL2Complete" | "permitPool" | "quotaDeferralStore">> & {
     onDeadLetter?: PipelineWorkerConfig["onDeadLetter"];
     onL1Complete?: PipelineWorkerConfig["onL1Complete"];
     onL2Complete?: PipelineWorkerConfig["onL2Complete"];
@@ -267,6 +286,9 @@ export class PipelineWorker {
   // dead-letter remove that timer without probing the backend.
   private pendingL1DeadLetterRetries = new Set<string>();
 
+  // L1/L2/L3 tasks waiting out an LLM quota / rate limit.
+  private quotaDeferrals: QuotaDeferralScheduler;
+
   // Metrics
   private metrics = {
     tasksConsumed: 0,
@@ -285,6 +307,8 @@ export class PipelineWorker {
     l1ExtractionFailed: 0,
     /** L1 slices given up on after L1_PARSE_DEAD_LETTER_LIMIT parse dead-letters. */
     l1SliceSkipped: 0,
+    /** L1/L2/L3 task failures deferred on an LLM quota / rate limit instead of retried. */
+    quotaDeferred: 0,
   };
 
   constructor(backend: IStateBackend, executor: TaskExecutor, config?: PipelineWorkerConfig, logger?: Logger) {
@@ -308,7 +332,14 @@ export class PipelineWorker {
       lockGranularity: config?.lockGranularity ?? "session",
       permitPool: config?.permitPool,
       deadLetterRetryDelayMs: config?.deadLetterRetryDelayMs ?? DEFAULT_DEAD_LETTER_RETRY_DELAY_MS,
+      quotaDeferDelayMs: config?.quotaDeferDelayMs ?? DEFAULT_QUOTA_DEFER_DELAY_MS,
     };
+    this.quotaDeferrals = new QuotaDeferralScheduler(
+      this.config.quotaDeferDelayMs,
+      (task) => this.backend.enqueueTask(task),
+      this.logger,
+      config?.quotaDeferralStore,
+    );
   }
 
   // ============================
@@ -320,6 +351,9 @@ export class PipelineWorker {
     this.running = true;
 
     this.logger.info(`${TAG} Starting (workerId=${this.config.workerId}, concurrency=${this.config.concurrency})`);
+
+    // Re-arm tasks deferred on an LLM quota before a restart
+    await this.quotaDeferrals.start();
 
     // 启动 pending 消息回收循环
     this.startPendingRecovery();
@@ -337,6 +371,7 @@ export class PipelineWorker {
 
     // 停止 pending recovery
     if (this.recoveryTimer) { clearInterval(this.recoveryTimer); this.recoveryTimer = null; }
+    this.quotaDeferrals.stop();
 
     // 释放所有活跃锁
     for (const lockKey of this.activeLocks) {
@@ -356,6 +391,8 @@ export class PipelineWorker {
       workerId: this.config.workerId,
       deadLetterCount: this.deadLetterQueue.length,
       l1FrozenSlices: this.frozenL1Slices.size,
+      /** Quota-deferred tasks whose re-run has not settled yet. */
+      quotaDeferredPending: this.quotaDeferrals.pendingCount(),
     };
   }
 
@@ -611,6 +648,7 @@ export class PipelineWorker {
       this.pendingL1DeadLetterRetries.delete(this.frozenL1SliceKey(task));
     }
     const frozenSlice = this.applyFrozenL1Slice(task);
+    let quotaDeferred = false;
     try {
       await this.executeTask(task, abortController.signal);
 
@@ -665,6 +703,12 @@ export class PipelineWorker {
         }
       }
 
+      // Quota / rate limit: wait it out, never toward the dead letter.
+      if (this.isQuotaDeferrable(task, err)) {
+        quotaDeferred = await this.deferForQuota(task, err);
+        if (quotaDeferred) return;
+      }
+
       // 指数退避重试
       const maxRetries = this.maxRetriesFor(task);
       if (retryCount < maxRetries) {
@@ -693,6 +737,8 @@ export class PipelineWorker {
       this.runningTasks.delete(task.id);
       try { await this.backend.releaseLock(lockKey, this.config.workerId); } catch { /* best effort */ }
       releasePermitOnce();
+      // A deferred task's re-run is over (done, retried, dead-lettered): drop its entry.
+      if (!quotaDeferred) await this.quotaDeferrals.settle(task);
 
       // Step 7: 延迟入队 — executor 可通过 task._deferredEnqueue 暂存需要在锁释放后才入队的任务，
       // 避免新任务立即被消费时因同 session 锁仍被持有而产生不必要的锁冲突。
@@ -708,6 +754,51 @@ export class PipelineWorker {
         }
       }
     }
+  }
+
+  // ============================
+  // LLM quota deferral
+  // ============================
+
+  /** L1/L2/L3 failures caused by an LLM quota or rate limit are deferred. */
+  private isQuotaDeferrable(task: TaskPayload, err: unknown): boolean {
+    return (task.type === "L1" || task.type === "L2" || task.type === "L3") && isLlmQuotaError(err);
+  }
+
+  /**
+   * ACK the failed message and hand the task to the quota scheduler, which
+   * enqueues it again after quotaDeferDelayMs with its retry count unchanged.
+   * The L1 runner has already stopped its cursor before the failed group and
+   * the L2 cursor only moves in cascadeSchedule, so neither advances. Returns
+   * false when the deferral could not be stored (the caller then falls back
+   * to the normal retry path, so the task is never silently dropped).
+   */
+  private async deferForQuota(task: TaskPayload, err: unknown): Promise<boolean> {
+    const key = `${task.type}\u0000${this.frozenL1SliceKey(task)}`;
+    let result;
+    try {
+      result = await this.quotaDeferrals.defer(task, key);
+    } catch (storeErr) {
+      this.logger.warn(
+        `${TAG} Quota deferral store failed for ${task.type} [${task.instanceId}/${task.sessionId}], falling back to retry: ` +
+        (storeErr instanceof Error ? storeErr.message : String(storeErr)),
+      );
+      return false;
+    }
+    this.metrics.quotaDeferred++;
+    const msgId = (task as any)._msgId;
+    if (msgId) {
+      try { await this.backend.ackTask(msgId); } catch { /* best effort */ }
+    }
+    // The provider body is never logged here, only status / provider code.
+    this.logger.warn(
+      `${TAG} LLM quota or rate limit on ${task.type} [${task.instanceId}/${task.sessionId}] (${describeLlmQuotaError(err)}): ` +
+      (result.merged
+        ? `merged into deferral ${result.entry.id} (runs at ${new Date(result.entry.fireAtMs).toISOString()})`
+        : `deferred ${this.config.quotaDeferDelayMs}ms as ${result.entry.id} (deferral #${result.entry.deferrals})`) +
+      "; retry count unchanged, not dead-lettered",
+    );
+    return true;
   }
 
   /** Retry budget of a task, shared by the lock-free and the locked handler. */
