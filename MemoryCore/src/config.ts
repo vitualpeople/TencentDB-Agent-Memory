@@ -256,6 +256,32 @@ export interface ReportConfig {
 }
 
 /**
+ * Values accepted for the OpenAI-compatible `reasoning_effort` request field.
+ * Lowercase only: a mistyped value must fail startup, not silently reach the
+ * provider or fall back to the provider default.
+ */
+export const LLM_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type LlmReasoningEffort = (typeof LLM_REASONING_EFFORTS)[number];
+
+/**
+ * Validate a configured reasoning effort. `undefined` and empty/blank strings
+ * mean "not set" (the request carries no `reasoning_effort`); any other value
+ * outside {@link LLM_REASONING_EFFORTS} throws, naming `source` (the env var
+ * or YAML key it came from) and the accepted values.
+ */
+export function parseLlmReasoningEffort(value: unknown, source: string): LlmReasoningEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = typeof value === "string" ? value.trim() : value;
+  if (raw === "") return undefined;
+  if (typeof raw === "string" && (LLM_REASONING_EFFORTS as readonly string[]).includes(raw)) {
+    return raw as LlmReasoningEffort;
+  }
+  throw new Error(
+    `${source} must be one of ${LLM_REASONING_EFFORTS.join("|")} (lowercase), got ${JSON.stringify(value)}`,
+  );
+}
+
+/**
  * Standalone LLM configuration — when set, TDAI uses direct API calls
  * instead of the host's built-in LLM runner (e.g. OpenClaw's runEmbeddedPiAgent).
  *
@@ -301,6 +327,11 @@ export interface StandaloneLLMOverrideConfig {
    * 等待完整文本",给只接受流式的兼容后端做兼容层用。
    */
   stream?: boolean;
+  /**
+   * `reasoning_effort` sent on every chat request of the standalone runner.
+   * Undefined (default) sends no such field, so the provider default applies.
+   */
+  reasoningEffort?: LlmReasoningEffort;
 }
 
 /** Context Offload settings — controls multi-layer context compression. */
@@ -809,6 +840,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         timeoutMs: num(llmGroup, "timeoutMs") ?? 120_000,
         provider,
         stream: bool(llmGroup, "stream") ?? false,
+        reasoningEffort: parseLlmReasoningEffort(llmGroup.reasoningEffort, "memory.llm.reasoningEffort"),
         proxy: {
           // 默认 true：走 proxy 时用 memory 系统用户 key 作为 Authorization。
           useMemorySystemUserKey: bool(proxyGroup, "useMemorySystemUserKey") ?? true,

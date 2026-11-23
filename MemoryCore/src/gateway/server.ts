@@ -1584,6 +1584,7 @@ export class TdaiGateway {
         ["model", this.config.llm.model],
         ["maxTokens", this.config.llm.maxTokens],
         ["timeoutMs", this.config.llm.timeoutMs],
+        ["reasoningEffort", this.config.llm.reasoningEffort],
       ]),
     };
     if (body.config_override) {
@@ -2029,6 +2030,7 @@ export class TdaiGateway {
         ["apiKey", effective.apiKey],
         ["model", effective.model ?? "default"],
         ["timeoutMs", effective.timeoutMs ?? 120_000],
+        ["reasoningEffort", effective.reasoningEffort],
       ]) as import("../adapters/standalone/llm-runner.js").StandaloneLLMConfig,
     });
     const cfg = this.core.getResolvedSkillConfig();

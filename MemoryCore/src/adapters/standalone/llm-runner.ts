@@ -32,6 +32,7 @@ import type {
 import type { LLMUsage } from "../../core/report/metric-tracking-runner.js";
 import { assertWriteAllowed, type CheckpointWriteGuard } from "../../utils/checkpoint.js";
 import { describeLlmQuotaError, isLlmQuotaError } from "../../utils/llm-quota-error.js";
+import type { LlmReasoningEffort } from "../../config.js";
 
 const TAG = "[memory-tdai] [standalone-runner]";
 
@@ -103,6 +104,11 @@ export interface StandaloneLLMConfig {
     /** 是否用 memory systemUser.userKey 作为 Authorization（默认 true）。 */
     useMemorySystemUserKey?: boolean;
   };
+  /**
+   * `reasoning_effort` for every chat request (env TDAI_LLM_REASONING_EFFORT).
+   * Undefined sends no such field, leaving the provider default in force.
+   */
+  reasoningEffort?: LlmReasoningEffort;
 }
 
 // ============================
@@ -348,6 +354,11 @@ export class StandaloneLLMRunner implements LLMRunner {
           ? { tools, stopWhen: stepCountIs(maxIterations) }
           : {}),
         maxOutputTokens: maxTokens,
+        // Sent as `reasoning_effort` only when configured, so an unset value
+        // leaves the request body exactly as before.
+        ...(this.config.reasoningEffort
+          ? { providerOptions: { openai: { reasoningEffort: this.config.reasoningEffort } } }
+          : {}),
         abortSignal: combinedSignal,
         experimental_telemetry: {
           isEnabled: true,
