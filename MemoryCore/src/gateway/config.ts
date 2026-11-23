@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { getEnv } from "../utils/env.js";
-import { parseConfig as parseMemoryConfig } from "../config.js";
+import { parseConfig as parseMemoryConfig, parseLlmReasoningEffort } from "../config.js";
 import type { MemoryTdaiConfig } from "../config.js";
 import type { StandaloneLLMConfig } from "../adapters/standalone/llm-runner.js";
 
@@ -466,6 +466,12 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
   const rawLlmProvider = env("TDAI_LLM_PROVIDER") ?? str(llmConfig, "provider");
   const llmProvider: "openai" | "proxy" =
     rawLlmProvider === "proxy" ? "proxy" : "openai";
+  // Optional reasoning_effort: env wins over YAML; empty means unset; any
+  // value outside the accepted lowercase list fails startup here.
+  const envReasoningEffort = env("TDAI_LLM_REASONING_EFFORT");
+  const llmReasoningEffort = envReasoningEffort !== undefined
+    ? parseLlmReasoningEffort(envReasoningEffort, "TDAI_LLM_REASONING_EFFORT")
+    : parseLlmReasoningEffort(llmConfig.reasoningEffort, "llm.reasoningEffort");
   const llm: StandaloneLLMConfig = {
     baseUrl: env("TDAI_LLM_BASE_URL") ?? str(llmConfig, "baseUrl") ?? "https://api.openai.com/v1",
     apiKey: env("TDAI_LLM_API_KEY") ?? str(llmConfig, "apiKey") ?? "",
@@ -476,6 +482,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     proxy: {
       useMemorySystemUserKey: bool(llmProxyConfig, "useMemorySystemUserKey") ?? true,
     },
+    reasoningEffort: llmReasoningEffort,
   };
 
   // Memory config (reuse the plugin's parseConfig for full compatibility)
@@ -510,6 +517,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
       proxy: {
         useMemorySystemUserKey: llm.proxy?.useMemorySystemUserKey ?? true,
       },
+      reasoningEffort: llm.reasoningEffort,
     };
   }
 

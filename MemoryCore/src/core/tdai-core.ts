@@ -29,7 +29,7 @@ import type {
   MemorySearchParams,
   ConversationSearchParams,
 } from "./types.js";
-import type { MemoryTdaiConfig } from "../config.js";
+import type { LlmReasoningEffort, MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import type { StorageAdapter } from "./storage/adapter.js";
@@ -644,6 +644,7 @@ export class TdaiCore {
     maxTokens: number;
     timeoutMs: number;
     stream: boolean;
+    reasoningEffort?: LlmReasoningEffort;
   } {
     const resolved = resolveStandaloneLlmForRuntime(this.cfg.llm, this.instanceId);
     return {
@@ -653,6 +654,7 @@ export class TdaiCore {
       maxTokens: resolved.maxTokens ?? 4096,
       timeoutMs: resolved.timeoutMs ?? 120_000,
       stream: resolved.stream ?? false,
+      reasoningEffort: resolved.reasoningEffort,
     };
   }
 
@@ -1025,6 +1027,7 @@ export class TdaiCore {
         maxTokens: runtimeLlm.maxTokens,
         timeoutMs: runtimeLlm.timeoutMs,
         stream: runtimeLlm.stream,
+        reasoningEffort: runtimeLlm.reasoningEffort,
       },
       // Default to enabled so the runner doesn't strip caller-provided tools.
       enableTools: true,

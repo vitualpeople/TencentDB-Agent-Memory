@@ -59,6 +59,7 @@ export TDAI_LLM_BASE_URL="https://api.deepseek.com/v1"   # 默认 https://api.op
 export TDAI_LLM_MODEL="deepseek-chat"                     # 默认 gpt-4o
 export TDAI_LLM_MAX_TOKENS=4096
 export TDAI_LLM_TIMEOUT_MS=120000
+# export TDAI_LLM_REASONING_EFFORT=low   # 可选：low|medium|high|xhigh|max，不设则请求不带 reasoning_effort
 
 # 可选 — 服务配置
 export TDAI_GATEWAY_PORT=8420            # 监听端口，默认 8420
@@ -458,6 +459,7 @@ memory:
 | `TDAI_LLM_MODEL` | `gpt-4o` | 全部 | 模型名称 |
 | `TDAI_LLM_MAX_TOKENS` | `4096` | 全部 | 最大输出 token |
 | `TDAI_LLM_TIMEOUT_MS` | `120000` | 全部 | LLM 请求超时 |
+| `TDAI_LLM_REASONING_EFFORT` | (不设) | 全部 | 请求体 `reasoning_effort`：`low`/`medium`/`high`/`xhigh`/`max`（仅小写）；不设或空串则不发送该字段；其他值启动报错。YAML 为 `llm.reasoningEffort`，env 优先 |
 | **Service 模式** |
 | `STATE_BACKEND` | (auto) | service | `redis` 或 `local` |
 | `REDIS_HOST` | `127.0.0.1` | service | Redis 地址 |
