@@ -263,7 +263,9 @@ describe("T6 firstDeferredAtMs: the age of a deferral counts from its first defe
     const legacyFireAt = now + 10 * 60_000; // deferred 5 min ago with a 15 min delay
     const task = { ...l1Task("L1-legacy", "proj:legacy"), data: { instanceId: "svc", agentId: "default", quotaDeferralId: "qd-legacy" } };
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ version: 1, entries: [{ id: "qd-legacy", key: "L1\u0000legacy", task, fireAtMs: legacyFireAt, deferrals: 1 }] }), "utf-8");
+    // Same (task type, session scope) key the worker builds for this task.
+    const key = ["L1", "svc", "", "default", "proj:legacy"].join("\u0000");
+    fs.writeFileSync(file, JSON.stringify({ version: 1, entries: [{ id: "qd-legacy", key, task, fireAtMs: legacyFireAt, deferrals: 1 }] }), "utf-8");
 
     const calls = { n: 0 };
     const backend = new LocalStateBackend();
@@ -310,6 +312,7 @@ describe("T6 firstDeferredAtMs: the age of a deferral counts from its first defe
       const pw = body.services.pipelineWorker;
       expect(pw.quotaDeferredPending).toBe(2);
       const expected = Date.now() - (now - 2 * 60 * 60_000);
+      expect(typeof pw.maxDeferralAgeMs).toBe("number");
       expect(pw.maxDeferralAgeMs).toBeGreaterThanOrEqual(2 * 60 * 60_000);
       expect(pw.maxDeferralAgeMs).toBeLessThanOrEqual(expected);
     } finally {
