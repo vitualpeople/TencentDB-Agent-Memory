@@ -251,6 +251,43 @@ function createReadOnlyTools(_workspaceDir: string, _logger?: Logger) {
 }
 
 // ============================
+// Token usage telemetry
+// ============================
+
+/** How one run() ended, as written on its usage line. */
+type RunOutcome = "ok" | "quota" | "timeout" | "abort" | "error";
+
+/** Tokens summed over the finished steps of one run(). */
+interface RunUsage {
+  steps: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Non-negative finite number or 0. */
+function tokenCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * Add one usage object to `acc`: AI SDK v6 reports inputTokens/outputTokens,
+ * earlier versions promptTokens/completionTokens.
+ */
+function addUsage(acc: RunUsage, usage: unknown): void {
+  if (!usage || typeof usage !== "object") return;
+  const u = usage as Record<string, unknown>;
+  acc.inputTokens += tokenCount(u.inputTokens ?? u.promptTokens);
+  acc.outputTokens += tokenCount(u.outputTokens ?? u.completionTokens);
+}
+
+function classifyRunOutcome(err: unknown, timeoutSignal: AbortSignal, callerSignal?: AbortSignal): RunOutcome {
+  if (callerSignal?.aborted) return "abort";
+  if (timeoutSignal.aborted) return "timeout";
+  if (isLlmQuotaError(err)) return "quota";
+  return "error";
+}
+
+// ============================
 // StandaloneLLMRunner
 // ============================
 
@@ -334,15 +371,20 @@ export class StandaloneLLMRunner implements LLMRunner {
       tools = undefined; // pure-text task — never expose any tool to the model
     }
 
-    try {
-      // H-11 Step 2: combine internal timeout with caller-provided abortSignal
-      // (e.g. pipeline-worker lost its lock and wants the LLM call to bail out).
-      // AbortSignal.any (Node 20+) aborts when ANY of the listed signals abort.
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
-      const combinedSignal = params.abortSignal
-        ? AbortSignal.any([timeoutSignal, params.abortSignal])
-        : timeoutSignal;
+    // H-11 Step 2: combine internal timeout with caller-provided abortSignal
+    // (e.g. pipeline-worker lost its lock and wants the LLM call to bail out).
+    // AbortSignal.any (Node 20+) aborts when ANY of the listed signals abort.
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const combinedSignal = params.abortSignal
+      ? AbortSignal.any([timeoutSignal, params.abortSignal])
+      : timeoutSignal;
 
+    // Summed per finished step, so a run that fails mid tool loop still
+    // reports what its earlier steps used (see logUsage).
+    const usage: RunUsage = { steps: 0, inputTokens: 0, outputTokens: 0 };
+    let outcome: RunOutcome = "error";
+
+    try {
       const result = await generateText({
         model: provider.chat(this.model),
         system: params.systemPrompt,
@@ -360,27 +402,28 @@ export class StandaloneLLMRunner implements LLMRunner {
           ? { providerOptions: { openai: { reasoningEffort: this.config.reasoningEffort } } }
           : {}),
         abortSignal: combinedSignal,
+        onStepFinish: (step) => {
+          usage.steps++;
+          addUsage(usage, step.usage);
+        },
         experimental_telemetry: {
           isEnabled: true,
           functionId: params.taskId,
           metadata: buildTelemetryMetadata(params),
         },
       });
+      outcome = "ok";
+
+      // A result whose steps were not reported one by one: take its totals.
+      if (usage.steps === 0) {
+        const r = result as { totalUsage?: unknown; usage?: unknown; steps?: unknown[] };
+        usage.steps = Array.isArray(r.steps) ? r.steps.length : 0;
+        addUsage(usage, r.totalUsage ?? r.usage);
+      }
 
       const text = (result.text ?? "").trim();
       const totalMs = Date.now() - runStartMs;
       this.health.recordSuccess();
-
-      // 暴露 token usage 到 side-channel（供 MetricTrackingRunner 读取）
-      if (result.usage) {
-        this.lastUsage = {
-          promptTokens: result.usage.promptTokens ?? 0,
-          completionTokens: result.usage.completionTokens ?? 0,
-          totalTokens: (result.usage.promptTokens ?? 0) + (result.usage.completionTokens ?? 0),
-        };
-      } else {
-        this.lastUsage = undefined;
-      }
 
       this.logger?.debug?.(
         `${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`,
@@ -426,6 +469,7 @@ export class StandaloneLLMRunner implements LLMRunner {
 
       return text;
     } catch (err) {
+      outcome = classifyRunOutcome(err, timeoutSignal, params.abortSignal);
       const totalMs = Date.now() - runStartMs;
       let errMsg = err instanceof Error ? err.message : String(err);
       if (isLlmQuotaError(err)) {
@@ -459,7 +503,22 @@ export class StandaloneLLMRunner implements LLMRunner {
       }
 
       throw err;
+    } finally {
+      this.logUsage(params.taskId, outcome, usage, Date.now() - runStartMs);
     }
+  }
+
+  /**
+   * One INFO line per run() with counts only (never prompt, reply or key),
+   * and the same totals on `lastUsage` for MetricTrackingRunner.
+   */
+  private logUsage(taskId: string, outcome: RunOutcome, usage: RunUsage, ms: number): void {
+    const totalTokens = usage.inputTokens + usage.outputTokens;
+    this.lastUsage = { promptTokens: usage.inputTokens, completionTokens: usage.outputTokens, totalTokens };
+    this.logger?.info(
+      `${TAG} usage: taskId=${taskId}, outcome=${outcome}, steps=${usage.steps}, ` +
+      `inputTokens=${usage.inputTokens}, outputTokens=${usage.outputTokens}, totalTokens=${totalTokens}, ms=${ms}`,
+    );
   }
 }
 

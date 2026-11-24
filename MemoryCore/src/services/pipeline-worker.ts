@@ -22,6 +22,7 @@ import { isL1ExtractionError, type L1ExtractionError } from "../core/record/l1-e
 import { describeLlmQuotaError, isLlmQuotaError } from "../utils/llm-quota-error.js";
 import { DEFAULT_QUOTA_DEFER_DELAY_MS, QuotaDeferralScheduler } from "./quota-deferral-scheduler.js";
 import type { QuotaDeferralStore } from "./quota-deferral-store.js";
+import { extractSessionForFilter, type SessionFilter } from "../utils/session-filter.js";
 
 // ============================
 // Types
@@ -141,6 +142,22 @@ export interface PipelineWorkerConfig {
    * them in RAM only.
    */
   quotaDeferralStore?: QuotaDeferralStore;
+
+  /**
+   * Sessions excluded from the pipeline (memory.capture.excludeAgents). The
+   * stateful pipeline never enqueues work for them; this catches what was
+   * queued or quota-deferred before the filter existed: such an L1/L2/L3/
+   * flush task is ACKed and dropped before it runs (no LLM call), and a
+   * stored quota deferral of it is removed at start. L2 keys
+   * `profile:...|session:<encoded>` are matched on their decoded session.
+   */
+  sessionFilter?: Pick<SessionFilter, "shouldSkip">;
+
+  /**
+   * Enqueue an L3 (persona) task after every L2 that did work (default true).
+   * The gateway passes false for memory.persona.triggerMode "off".
+   */
+  l3Enabled?: boolean;
 }
 
 /**
@@ -255,11 +272,12 @@ export async function claimDeadLetterRetryL1Count(
 export class PipelineWorker {
   private backend: IStateBackend;
   private executor: TaskExecutor;
-  private config: Required<Omit<PipelineWorkerConfig, "onDeadLetter" | "onL1Complete" | "onL2Complete" | "permitPool" | "quotaDeferralStore">> & {
+  private config: Required<Omit<PipelineWorkerConfig, "onDeadLetter" | "onL1Complete" | "onL2Complete" | "permitPool" | "quotaDeferralStore" | "sessionFilter">> & {
     onDeadLetter?: PipelineWorkerConfig["onDeadLetter"];
     onL1Complete?: PipelineWorkerConfig["onL1Complete"];
     onL2Complete?: PipelineWorkerConfig["onL2Complete"];
     permitPool?: PipelineWorkerConfig["permitPool"];
+    sessionFilter?: PipelineWorkerConfig["sessionFilter"];
   };
   private logger: Logger;
 
@@ -309,6 +327,8 @@ export class PipelineWorker {
     l1SliceSkipped: 0,
     /** L1/L2/L3 task failures deferred on an LLM quota / rate limit instead of retried. */
     quotaDeferred: 0,
+    /** Tasks of an excluded session (sessionFilter) ACKed and dropped before running. */
+    sessionFiltered: 0,
   };
 
   constructor(backend: IStateBackend, executor: TaskExecutor, config?: PipelineWorkerConfig, logger?: Logger) {
@@ -333,12 +353,15 @@ export class PipelineWorker {
       permitPool: config?.permitPool,
       deadLetterRetryDelayMs: config?.deadLetterRetryDelayMs ?? DEFAULT_DEAD_LETTER_RETRY_DELAY_MS,
       quotaDeferDelayMs: config?.quotaDeferDelayMs ?? DEFAULT_QUOTA_DEFER_DELAY_MS,
+      sessionFilter: config?.sessionFilter,
+      l3Enabled: config?.l3Enabled ?? true,
     };
     this.quotaDeferrals = new QuotaDeferralScheduler(
       this.config.quotaDeferDelayMs,
       (task) => this.backend.enqueueTask(task),
       this.logger,
       config?.quotaDeferralStore,
+      config?.sessionFilter,
     );
   }
 
@@ -436,6 +459,10 @@ export class PipelineWorker {
   // ============================
 
   private async processTask(task: TaskPayload): Promise<void> {
+    if (this.isExcludedSession(task)) {
+      await this.dropExcludedTask(task);
+      return;
+    }
     const lockKey = this.getLockKey(task);
     const retryCount = (task.data?.retryCount as number) ?? 0;
 
@@ -757,6 +784,32 @@ export class PipelineWorker {
   }
 
   // ============================
+  // Excluded sessions (memory.capture.excludeAgents)
+  // ============================
+
+  /** A memory pipeline task (L1/L2/L3/flush) of a session the filter excludes. */
+  private isExcludedSession(task: TaskPayload): boolean {
+    const filter = this.config.sessionFilter;
+    if (!filter) return false;
+    if (task.type !== "L1" && task.type !== "L2" && task.type !== "L3" && task.type !== "flush") return false;
+    return filter.shouldSkip(extractSessionForFilter(task.sessionId));
+  }
+
+  /** ACK and forget a task of an excluded session, quota deferral included; nothing runs. */
+  private async dropExcludedTask(task: TaskPayload): Promise<void> {
+    this.metrics.sessionFiltered++;
+    const msgId = (task as any)._msgId;
+    if (msgId) {
+      try { await this.backend.ackTask(msgId); } catch { /* best effort */ }
+    }
+    await this.quotaDeferrals.settle(task);
+    this.logger.info(
+      `${TAG} Dropped ${task.type} [${task.instanceId}/${task.sessionId}] (task=${task.id}): ` +
+      "session excluded by memory.capture.excludeAgents",
+    );
+  }
+
+  // ============================
   // LLM quota deferral
   // ============================
 
@@ -872,17 +925,20 @@ export class PipelineWorker {
 
       // L2 完成 → 直接入队 L3（携带 trace context 用于跨异步链路关联）
       // L3 task 也带 team/agent，保锁粒度对齐
-      await this.backend.enqueueTask({
-        id: `L3-${task.instanceId}-${now}`,
-        type: "L3",
-        instanceId: task.instanceId,
-        sessionId: task.sessionId,
-        teamId: tid,
-        agentId: aid,
-        priority: 2,
-        data: task.data ? { ...task.data, ...serializeTraceContext() } : { teamId: tid, agentId: aid, ...serializeTraceContext() },
-        createdAt: now,
-      });
+      // persona.triggerMode "off" (l3Enabled=false): no L3 at all.
+      if (this.config.l3Enabled) {
+        await this.backend.enqueueTask({
+          id: `L3-${task.instanceId}-${now}`,
+          type: "L3",
+          instanceId: task.instanceId,
+          sessionId: task.sessionId,
+          teamId: tid,
+          agentId: aid,
+          priority: 2,
+          data: task.data ? { ...task.data, ...serializeTraceContext() } : { teamId: tid, agentId: aid, ...serializeTraceContext() },
+          createdAt: now,
+        });
+      }
       await this.backend.updateSessionState(task.instanceId, task.sessionId, {
         l2_pending_l1_count: 0,
         l2_last_extraction_time: new Date().toISOString(),

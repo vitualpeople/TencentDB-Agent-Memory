@@ -1833,11 +1833,16 @@ export class TdaiGateway {
     // Service mode: defaultInstanceId must NOT be "default"; all calls must provide explicit instanceId.
     // Standalone mode: uses configured instanceId or "default" as fallback.
     const instanceId = this.config.instanceId ?? (this.config.deployMode === "service" ? "__unset__" : "default");
+    // memory.capture.excludeAgents: excluded sessions keep their L0 rows but
+    // get no L1/L2/L3 work, neither new (the manager) nor left from before
+    // (the worker and its quota deferrals).
+    const pipelineSessionFilter = new SessionFilter(this.config.memory.capture.excludeAgents);
     const statefulManager = createStatefulPipelineManager(
       this.config.memory,
       this.stateBackend,
       instanceId,
       this.logger,
+      pipelineSessionFilter,
     );
     this.statefulPipelineManager = statefulManager;
     // Attach to core — core.setStatefulPipelineManager will wire capture to use captureAtomic
@@ -1883,6 +1888,10 @@ export class TdaiGateway {
       onL2Complete: statefulManager.armL2MaxInterval.bind(statefulManager),
       // 与 skill worker 共享的节点级并发上限
       permitPool: this.workerPermitPool ?? undefined,
+      // Drop queued / quota-deferred work of sessions excluded since it was queued.
+      sessionFilter: pipelineSessionFilter,
+      // persona.triggerMode "off": L2 enqueues no L3.
+      l3Enabled: this.config.memory.persona.triggerMode !== "off",
     }, this.logger);
     await this.pipelineWorker.start();
     this.logger.info("Pipeline Worker started");
@@ -2895,6 +2904,13 @@ export class TdaiGateway {
       async executeL3(task: TaskPayload, signal?: AbortSignal) {
         const instanceId = typeof task.data?.instanceId === "string" ? task.data.instanceId : undefined;
         if (!instanceId) throw new Error(`L3 task ${task.id} missing instanceId`);
+
+        // persona.triggerMode "off": an L3 task left from before (queue or
+        // quota deferral file) completes as a no-op, with no LLM / Jev call.
+        if (gateway.config.memory?.persona?.triggerMode === "off") {
+          gateway.logger.debug?.(`[executor] L3 skipped: persona.triggerMode=off (task=${task.id})`);
+          return;
+        }
 
         if (signal?.aborted) throw signal.reason ?? new Error("executeL3: aborted before start");
 

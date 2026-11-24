@@ -343,9 +343,12 @@ export class StatefulPipelineManager {
       this.logger?.error?.(`${TAG} armL2MaxInterval called without explicit instanceId (session=${sessionKey})`);
       return;
     }
-    await this.stateBackend.setTimer(
+    // Same member as advanceL2TimerAfterL1, so the two never run as two
+    // parallel L2 timers; an earlier pending fire time (an L1 that finished
+    // meanwhile) is kept rather than pushed out to maxInterval.
+    await this.stateBackend.setTimerIfEarlier(
       effectiveId,
-      `${sessionKey}:L2_schedule`,
+      buildPipelineTimerMember(sessionKey, "L2_schedule", { teamId, agentId }),
       Date.now() + this.l2MaxIntervalMs,
     );
   }

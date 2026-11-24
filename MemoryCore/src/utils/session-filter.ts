@@ -65,11 +65,46 @@ const BUILTIN_MATCHERS: SessionKeyMatcher[] = [
  * Since sessionKeys look like `agent:<agentId>:...`, we match the
  * glob against the whole key so users can write patterns like
  * `bench-judge-*` (matched anywhere) or more specific ones.
+ *
+ * A leading `^` anchors the pattern to the start of the key and a trailing
+ * `$` to its end (`^plan-hash:*` matches `plan-hash:abc` but not
+ * `proj:plan-hash:foo`). Every other character, including a `^` or `$`
+ * elsewhere, is literal.
  */
 function globToMatcher(pattern: string): SessionKeyMatcher {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  const re = new RegExp(escaped);
+  let anchorStart = pattern.startsWith("^");
+  let anchorEnd = pattern.length > (anchorStart ? 1 : 0) && pattern.endsWith("$");
+  let body = pattern.slice(anchorStart ? 1 : 0, anchorEnd ? -1 : undefined);
+  // A pattern made only of anchors ("^", "$", "^$") stays literal, as before,
+  // instead of turning into a match-everything rule.
+  if (body.length === 0) {
+    anchorStart = false;
+    anchorEnd = false;
+    body = pattern;
+  }
+  const escaped = body.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  const re = new RegExp(`${anchorStart ? "^" : ""}${escaped}${anchorEnd ? "$" : ""}`);
   return (key) => re.test(key);
+}
+
+const PROFILE_SESSION_MARKER = "|session:";
+
+/**
+ * The session a pipeline key belongs to, for filtering. L2 keys look like
+ * `profile:<scope>|session:<encodeURIComponent(session)>`: the source session
+ * after `|session:` is decoded and returned. Any other key (a plain session
+ * key, or a profile key with no source session) comes back unchanged.
+ */
+export function extractSessionForFilter(sessionOrProfileKey: string): string {
+  if (!sessionOrProfileKey.startsWith("profile:")) return sessionOrProfileKey;
+  const idx = sessionOrProfileKey.indexOf(PROFILE_SESSION_MARKER);
+  if (idx < 0) return sessionOrProfileKey;
+  const encoded = sessionOrProfileKey.slice(idx + PROFILE_SESSION_MARKER.length);
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
 }
 
 // ============================

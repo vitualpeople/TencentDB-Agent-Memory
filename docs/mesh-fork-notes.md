@@ -76,6 +76,27 @@ pins `chauit/tencentdb-agent-memory@sha256:<digest>`; the workflow prints the
 digest of each published image in its step summary, and bumping that pin is a
 change in the mesh repository, not here.
 
+## Pipeline cost controls
+
+- `memory.capture.excludeAgents` takes glob patterns (`*` only). A leading
+  `^` anchors a pattern to the start of the session key and a trailing `$` to
+  its end; a pattern with no `^` matches anywhere in the key, as upstream
+  (`bench-judge-*`). With `["^plan-hash:*", "^deploy:*"]` those sessions keep
+  their L0 rows (`/v2/conversation/add` and `/v2/conversation/query` work as
+  before) but get no L1, L2 or L3 task. Tasks of an excluded session that were
+  queued or quota-deferred (`<data>/metadata/pipeline-quota-deferrals.json`)
+  before the filter was set are dropped without an LLM call; an L2 key
+  `profile:...|session:<encoded>` is matched on its decoded session.
+- `TDAI_PERSONA_TRIGGER_MODE=off` (or `memory.persona.triggerMode: "off"`)
+  turns L3 persona generation off: no L3 task after L2, a leftover L3 task
+  completes as a no-op, and no Jev or OpenRouter key is needed. Images built
+  before this mode reject `off` at startup, so set the mode back to `current`
+  (or `jev`) before rolling back to one.
+- Every standalone LLM call logs one INFO line
+  `[standalone-runner] usage: taskId=..., outcome=ok|quota|timeout|abort|error,
+  steps=..., inputTokens=..., outputTokens=..., totalTokens=..., ms=...`,
+  summed over the steps of a tool loop, counts only (no prompt, reply or key).
+
 ## Contract
 
 The mesh adapter is written against this build's `/v2` routes. A change to any
