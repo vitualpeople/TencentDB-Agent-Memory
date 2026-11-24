@@ -26,6 +26,12 @@ export interface QuotaDeferralEntry {
   fireAtMs: number;
   /** Consecutive quota deferrals of this scope, this one included. */
   deferrals: number;
+  /**
+   * When this scope was first deferred (epoch ms), kept across every later
+   * deferral and restart; the age on /health counts from it. Absent in files
+   * written before it existed: read as `fireAtMs - delayMs`.
+   */
+  firstDeferredAtMs?: number;
 }
 
 export interface QuotaDeferralStore {

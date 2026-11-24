@@ -206,6 +206,14 @@ export interface LLMRunnerCreateOptions {
    * Default: false (text-only output).
    */
   enableTools?: boolean;
+  /**
+   * End the call on the first quota / rate-limit reply (HTTP 429, or a
+   * provider quota code in the body) with an LlmQuotaError, instead of letting
+   * the LLM client retry it. Network errors and 5xx keep the client's retry.
+   * Meant for pipeline runners, whose quota failures PipelineWorker defers.
+   * Default: true for StandaloneLLMRunnerFactory; other hosts may ignore it.
+   */
+  failFastOnQuota?: boolean;
 }
 
 /**

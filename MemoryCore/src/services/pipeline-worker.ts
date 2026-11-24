@@ -416,6 +416,8 @@ export class PipelineWorker {
       l1FrozenSlices: this.frozenL1Slices.size,
       /** Quota-deferred tasks whose re-run has not settled yet. */
       quotaDeferredPending: this.quotaDeferrals.pendingCount(),
+      /** Age of the oldest of those, counted from its first deferral (0 when none). */
+      maxDeferralAgeMs: this.quotaDeferrals.maxDeferralAgeMs(),
     };
   }
 

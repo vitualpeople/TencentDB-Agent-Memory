@@ -31,7 +31,13 @@ import type {
 } from "../../core/types.js";
 import type { LLMUsage } from "../../core/report/metric-tracking-runner.js";
 import { assertWriteAllowed, type CheckpointWriteGuard } from "../../utils/checkpoint.js";
-import { describeLlmQuotaError, isLlmQuotaError } from "../../utils/llm-quota-error.js";
+import {
+  LLM_QUOTA_PROVIDER_CODES,
+  LlmQuotaError,
+  describeLlmQuotaError,
+  findLlmQuotaSignal,
+  isLlmQuotaError,
+} from "../../utils/llm-quota-error.js";
 import type { LlmReasoningEffort } from "../../config.js";
 
 const TAG = "[memory-tdai] [standalone-runner]";
@@ -288,6 +294,62 @@ function classifyRunOutcome(err: unknown, timeoutSignal: AbortSignal, callerSign
 }
 
 // ============================
+// Quota fail-fast fetch
+// ============================
+
+function requestUrl(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return input.url;
+}
+
+/** MiniMax base_resp quota code in a JSON reply body, read from a clone. */
+async function quotaProviderCodeOf(res: Response): Promise<{ code: number; body: string } | undefined> {
+  if (!(res.headers.get("content-type") ?? "").includes("json")) return undefined;
+  let body: string;
+  try {
+    body = await res.clone().text();
+  } catch {
+    return undefined;
+  }
+  if (!body.includes("base_resp")) return undefined;
+  try {
+    const code = (JSON.parse(body) as { base_resp?: { status_code?: unknown } })?.base_resp?.status_code;
+    return typeof code === "number" && LLM_QUOTA_PROVIDER_CODES.has(code) ? { code, body } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `fetch` for the AI SDK provider that throws an LlmQuotaError on an HTTP 429
+ * or a MiniMax quota code (LLM_QUOTA_PROVIDER_CODES, any status). The AI SDK
+ * retries only an APICallError marked retryable, and passes any other error
+ * thrown by `fetch` through unchanged, so the quota reply costs one call and
+ * reaches PipelineWorker.deferForQuota at once; 5xx replies and network
+ * errors are returned / thrown as before and keep the AI SDK retry.
+ * The global fetch is read per call (tests stub it).
+ */
+export function createQuotaFailFastFetch(): typeof fetch {
+  return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const res = await globalThis.fetch(input, init);
+    const quota = res.status === 429 ? { body: undefined } : await quotaProviderCodeOf(res);
+    if (!quota) return res;
+    // The body stays on the cause for classification only; it is never logged.
+    const cause = new APICallError({
+      message: res.status === 429 ? "Too Many Requests" : "Provider quota limit",
+      url: requestUrl(input),
+      requestBodyValues: {},
+      statusCode: res.status,
+      responseBody: quota.body,
+      isRetryable: false,
+    });
+    await res.body?.cancel().catch(() => {});
+    throw new LlmQuotaError(cause, "provider reply");
+  }) as typeof fetch;
+}
+
+// ============================
 // StandaloneLLMRunner
 // ============================
 
@@ -298,6 +360,8 @@ export class StandaloneLLMRunner implements LLMRunner {
   private logger?: Logger;
   /** Sink read by /health; shared by every runner in the process unless injected. */
   private health: ProviderHealthSink;
+  /** See LLMRunnerCreateOptions.failFastOnQuota. */
+  private failFastOnQuota: boolean;
 
   /**
    * Side-channel: 最近一次 run() 调用的 token usage。
@@ -316,12 +380,19 @@ export class StandaloneLLMRunner implements LLMRunner {
      * runner (L1, dedup, L2, L3, skill, seed) reports into the one /health reads.
      */
     health?: ProviderHealthSink;
+    /**
+     * Throw LlmQuotaError on the first quota reply instead of letting the AI
+     * SDK retry it (default false: a runner with no quota deferral behind it,
+     * e.g. the skill extractor, keeps the AI SDK retry on 429).
+     */
+    failFastOnQuota?: boolean;
   }) {
     this.config = opts.config;
     this.model = opts.model ?? opts.config.model;
     this.enableTools = opts.enableTools ?? false;
     this.logger = opts.logger;
     this.health = opts.health ?? llmProviderHealth;
+    this.failFastOnQuota = opts.failFastOnQuota ?? false;
   }
 
   async run(params: LLMRunParams): Promise<string> {
@@ -349,6 +420,7 @@ export class StandaloneLLMRunner implements LLMRunner {
       baseURL: this.config.baseUrl,
       apiKey: this.config.apiKey,
       compatibility: "compatible",
+      ...(this.failFastOnQuota ? { fetch: createQuotaFailFastFetch() } : {}),
     });
 
     // Select tools based on mode + storage
@@ -472,10 +544,14 @@ export class StandaloneLLMRunner implements LLMRunner {
       outcome = classifyRunOutcome(err, timeoutSignal, params.abortSignal);
       const totalMs = Date.now() - runStartMs;
       let errMsg = err instanceof Error ? err.message : String(err);
+      // The fail-fast fetch throws LlmQuotaError around the provider's APICallError.
+      const apiErr = APICallError.isInstance(err)
+        ? err
+        : err instanceof LlmQuotaError && APICallError.isInstance(err.cause) ? err.cause : undefined;
       if (isLlmQuotaError(err)) {
         // Quota / rate limit: the worker defers the task. Log only the status
         // and provider code, never the provider's message or body.
-        errMsg = `LLM quota or rate limit (${describeLlmQuotaError(err)}${APICallError.isInstance(err) ? `, url=${err.url}` : ""})`;
+        errMsg = `LLM quota or rate limit (${describeLlmQuotaError(err)}${apiErr ? `, url=${apiErr.url}` : ""})`;
       } else if (APICallError.isInstance(err)) {
         // Provider HTTP errors carry the status, url and response body; the bare
         // message alone does not say which upstream call failed or why.
@@ -486,7 +562,7 @@ export class StandaloneLLMRunner implements LLMRunner {
       this.logger?.error(`${TAG} run() failed after ${totalMs}ms: ${errMsg}`);
       // A caller abort (lost lock, shutdown) says nothing about the provider.
       if (!params.abortSignal?.aborted) {
-        this.health.recordFailure(APICallError.isInstance(err) ? err.statusCode : null);
+        this.health.recordFailure(apiErr?.statusCode ?? findLlmQuotaSignal(err)?.status ?? null);
       }
 
       if (params.instanceId) {
@@ -572,6 +648,9 @@ export class StandaloneLLMRunnerFactory implements LLMRunnerFactory {
       enableTools,
       logger: this.logger,
       health: this.health,
+      // Factory runners serve the pipeline (L1, dedup, L2, L3, seed): a quota
+      // reply goes straight to the worker's deferral, not through AI SDK retries.
+      failFastOnQuota: opts?.failFastOnQuota ?? true,
     });
   }
 }
