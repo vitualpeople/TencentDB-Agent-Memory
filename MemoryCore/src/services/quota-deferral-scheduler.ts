@@ -75,8 +75,9 @@ export class QuotaDeferralScheduler {
         }
         continue;
       }
-      this.byKey.set(entry.key, entry);
-      this.arm(entry);
+      const restoredEntry = { ...entry, firstDeferredAtMs: this.firstDeferredAt(entry) };
+      this.byKey.set(restoredEntry.key, restoredEntry);
+      this.arm(restoredEntry);
       restored++;
     }
     if (restored > 0) this.logger.info(`${TAG} Restored ${restored} quota-deferred task(s)`);
@@ -93,6 +94,15 @@ export class QuotaDeferralScheduler {
     return this.byKey.size;
   }
 
+  /** Age of the oldest unsettled deferral, from its first deferral (0 when none). */
+  maxDeferralAgeMs(now = Date.now()): number {
+    let oldest = 0;
+    for (const entry of this.byKey.values()) {
+      oldest = Math.max(oldest, now - this.firstDeferredAt(entry));
+    }
+    return oldest;
+  }
+
   /**
    * Defer `task` for its scope `key`. A re-run of an existing entry that hits
    * the limit again re-arms that entry; any other task of a scope that is
@@ -103,13 +113,16 @@ export class QuotaDeferralScheduler {
     const ownId = task.data?.[QUOTA_DEFERRAL_ID_KEY];
     if (existing && existing.id !== ownId) return { entry: existing, merged: true };
 
-    const id = existing?.id ?? `qd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    const id = existing?.id ?? `qd-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const entry: QuotaDeferralEntry = {
       id,
       key,
       task: stripRuntimeFields(task, id),
-      fireAtMs: Date.now() + this.delayMs,
+      fireAtMs: now + this.delayMs,
       deferrals: (existing?.deferrals ?? 0) + 1,
+      // A re-run's createdAt is its enqueue time; the scope's wait starts here.
+      firstDeferredAtMs: existing ? this.firstDeferredAt(existing) : now,
     };
     await this.store.put(entry);
     this.byKey.set(key, entry);
@@ -133,6 +146,13 @@ export class QuotaDeferralScheduler {
     } catch (err) {
       this.logger.warn(`${TAG} Failed to remove deferred task ${id}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /** Stored first deferral time, or `fireAtMs - delayMs` for an entry from an older file. */
+  private firstDeferredAt(entry: QuotaDeferralEntry): number {
+    return typeof entry.firstDeferredAtMs === "number" && Number.isFinite(entry.firstDeferredAtMs)
+      ? entry.firstDeferredAtMs
+      : entry.fireAtMs - this.delayMs;
   }
 
   private arm(entry: QuotaDeferralEntry): void {
